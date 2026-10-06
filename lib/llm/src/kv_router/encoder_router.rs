@@ -33,7 +33,11 @@ type EncodePushRouter = PushRouter<PreprocessedRequest, Annotated<LLMEngineOutpu
 struct EncoderBinding {
     target_id: WorkerSetTargetId,
     router: Arc<EncodePushRouter>,
+    /// Unique per binding; the coordinator's encode pool generation.
+    generation: u64,
 }
+
+static BINDING_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -141,6 +145,7 @@ impl EncoderRouter {
         Ok(EncoderBinding {
             target_id,
             router: Arc::new(router),
+            generation: BINDING_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -295,6 +300,58 @@ impl EncoderRouter {
                 .is_some_and(|media| media.values().any(|items| !items.is_empty()))
     }
 
+    /// Select the encode worker through the stage coordinator, then dispatch
+    /// to exactly that worker. The single-stage topology is the encode half of
+    /// the DEP's E/P/D flow; the prefill router runs the P/D half on the
+    /// request this hop hands downstream.
+    async fn dispatch_coordinated(
+        binding: &EncoderBinding,
+        encode_context: SingleIn<PreprocessedRequest>,
+    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
+        use dynamo_kv_router::WorkerType;
+        use dynamo_kv_router::coordination::{
+            AggregatedPolicy, HostAction, HostEvent, PlanningMode, PoolRef, RoutingCoordinator,
+            StageBinding, StageId, Topology,
+        };
+
+        use crate::kv_router::coordination::{EncoderStageSelector, routing_request_for};
+
+        let pool = PoolRef::new("encode", binding.generation);
+        let coordinator = RoutingCoordinator::new(
+            Topology::single(StageId::ENCODE),
+            [StageBinding::new(
+                StageId::ENCODE,
+                pool.clone(),
+                WorkerType::Encode,
+                Arc::new(EncoderStageSelector::new(Arc::clone(&binding.router), pool)),
+            )],
+            Arc::new(|_| Box::new(AggregatedPolicy::for_stage(StageId::ENCODE))),
+        )?;
+        let request_id = encode_context.id().to_string();
+        let routing_request = routing_request_for(encode_context.content(), &request_id, None)
+            .with_encode_input(true);
+        let mut session = coordinator.start(routing_request, PlanningMode::Progressive)?;
+        let HostAction::Execute(ready) = coordinator
+            .advance(&mut session, HostEvent::Continue)
+            .await?
+        else {
+            anyhow::bail!("encode stage was not selected");
+        };
+        let worker_id = ready.target.worker.worker_id;
+        let response = binding.router.direct(encode_context, worker_id).await?;
+        // Encode has no handoff to wait for; routing is complete once dispatched.
+        let _ = coordinator
+            .advance(
+                &mut session,
+                HostEvent::Dispatched {
+                    stage: StageId::ENCODE,
+                    attempt: ready.attempt,
+                },
+            )
+            .await;
+        Ok(response)
+    }
+
     async fn consume_encode_stream(
         mut response: ManyOut<Annotated<LLMEngineOutput>>,
     ) -> Result<(serde_json::Value, Option<TraceLink>)> {
@@ -350,7 +407,11 @@ impl
                 .binding
                 .load_full()
                 .context("Encoder router is active but not initialized")?;
-            let response = binding.router.generate(encode_context).await?;
+            let response = if super::prefill_router::stage_coordinator_enabled() {
+                Self::dispatch_coordinated(&binding, encode_context).await?
+            } else {
+                binding.router.generate(encode_context).await?
+            };
             Self::consume_encode_stream(response).await
         }
         .await;

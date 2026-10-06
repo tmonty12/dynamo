@@ -43,6 +43,7 @@ mod conditional_bypass;
 mod coordinated;
 mod handoff;
 mod query;
+pub(crate) use coordinated::stage_coordinator_enabled;
 use handoff::PrefillTask;
 pub use query::PrefillReservation;
 

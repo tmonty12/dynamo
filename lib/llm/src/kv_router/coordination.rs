@@ -35,7 +35,8 @@ use dynamo_kv_router::coordination::{
 use dynamo_kv_router::protocols::{WorkerId, WorkerWithDpRank};
 use dynamo_kv_router::scheduling::{KvSchedulerError, queue::BookingHandle};
 use dynamo_runtime::error::{ErrorType, match_error_chain};
-use dynamo_runtime::pipeline::{Context, SingleIn};
+use dynamo_runtime::pipeline::{Context, PushRouter, SingleIn};
+use dynamo_runtime::protocols::annotated::Annotated;
 
 use crate::kv_router::prefill_router::PrefillError;
 use crate::kv_router::request_lease::RequestAttemptLease;
@@ -43,6 +44,7 @@ use crate::kv_router::routing_host::{RoutePlan, RoutePlanSignals, RoutePreview, 
 use crate::kv_router::to_worker_selection_session_context;
 use crate::kv_router::{FindBestMatchOutcome, KvRouter, PrefillRouter};
 use crate::preprocessor::PreprocessedRequest;
+use crate::protocols::common::llm_backend::LLMEngineOutput;
 use crate::protocols::common::timing::RequestPhase;
 
 /// Translate a host request into the coordinator's request shape.
@@ -904,6 +906,124 @@ impl StageSelector for PrefillRouterStageSelector {
             target,
             SelectionSignals::default(),
             ReservationLease::new(reservation),
+        ))
+    }
+}
+
+/// A coordinator stage selector for an encoder pool routed round-robin by a
+/// [`PushRouter`]: no KV index, no token accounting, no reservation. Selection
+/// advances the router's own round-robin cursor, so the pool rotates exactly
+/// as it did when the router dispatched directly.
+pub struct EncoderStageSelector {
+    router: Arc<PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>>,
+    pool: PoolRef,
+}
+
+impl EncoderStageSelector {
+    pub fn new(
+        router: Arc<PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>>,
+        pool: PoolRef,
+    ) -> Self {
+        Self { router, pool }
+    }
+
+    pub fn pool(&self) -> &PoolRef {
+        &self.pool
+    }
+
+    fn choose(&self, input: &SelectionInput<'_>) -> Result<WorkerId, CoordinationError> {
+        if let Some(pinned) = input.restrictions.pinned_worker {
+            self.router
+                .ensure_routable(pinned.worker_id)
+                .map_err(|error| CoordinationError::NoEligibleWorkers {
+                    stage: input.stage.clone(),
+                    reason: error.to_string(),
+                })?;
+            return Ok(pinned.worker_id);
+        }
+        let restrictions = input.restrictions;
+        let unrestricted = restrictions.allowed_worker_ids.is_none()
+            && restrictions.excluded_worker_ids.is_empty();
+        let selected = if unrestricted {
+            self.router.select_next_worker()
+        } else {
+            // A restricted selection cannot use the router's cursor: pick the
+            // first permitted worker in a stable order.
+            self.router
+                .with_selectable_worker_ids(|ids| {
+                    let mut ids: Vec<WorkerId> = ids
+                        .iter()
+                        .copied()
+                        .filter(|id| restrictions.permits(*id))
+                        .collect();
+                    ids.sort_unstable();
+                    ids.first().copied()
+                })
+                .ok()
+                .flatten()
+        };
+        selected.ok_or_else(|| CoordinationError::NoEligibleWorkers {
+            stage: input.stage.clone(),
+            reason: "no encode workers are available".to_string(),
+        })
+    }
+
+    fn target(&self, input: &SelectionInput<'_>, worker_id: WorkerId) -> SelectedTarget {
+        SelectedTarget {
+            invocation: input.invocation,
+            attempt: input.attempt,
+            stage: input.stage.clone(),
+            pool: self.pool.clone(),
+            worker: WorkerWithDpRank::new(worker_id, 0),
+            facts: Arc::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl StageSelector for EncoderStageSelector {
+    async fn preview(&self, input: SelectionInput<'_>) -> Result<Preview, CoordinationError> {
+        // Peeking does not advance the cursor, so a preview followed by an
+        // admission lands on the same worker.
+        let worker_id = match input.restrictions.pinned_worker {
+            Some(pinned) => pinned.worker_id,
+            None => self.router.peek_next_worker().ok_or_else(|| {
+                CoordinationError::NoEligibleWorkers {
+                    stage: input.stage.clone(),
+                    reason: "no encode workers are available".to_string(),
+                }
+            })?,
+        };
+        Ok(Preview {
+            target: self.target(&input, worker_id),
+            signals: SelectionSignals::default(),
+        })
+    }
+
+    async fn admit(
+        &self,
+        input: SelectionInput<'_>,
+        target: AdmissionTarget,
+    ) -> Result<StageReservation, CoordinationError> {
+        let worker_id = match target {
+            AdmissionTarget::AnyEligible => self.choose(&input)?,
+            AdmissionTarget::FromPreview(preview) => {
+                validate_foreign_preview(&self.pool, &input, &preview)?;
+                self.router
+                    .ensure_routable(preview.target.worker.worker_id)
+                    .map_err(|error| CoordinationError::StalePreview {
+                        stage: input.stage.clone(),
+                        reason: error.to_string(),
+                    })?;
+                // Keep the cursor moving as a fresh selection would have.
+                let _ = self.router.select_next_worker();
+                preview.target.worker.worker_id
+            }
+        };
+        Ok(StageReservation::new(
+            self.target(&input, worker_id),
+            SelectionSignals::default(),
+            ReservationLease::untracked(),
         ))
     }
 }

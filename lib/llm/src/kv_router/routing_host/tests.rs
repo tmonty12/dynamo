@@ -4852,4 +4852,145 @@ mod coordinated {
         drop(decode);
         runtime.shutdown();
     }
+
+    /// The encoder selector rotates the pool exactly as the round-robin router
+    /// did, previews do not advance the cursor, and nothing is reserved.
+    #[tokio::test]
+    async fn encoder_stage_selector_rotates_the_pool_without_reserving() {
+        use crate::kv_router::coordination::EncoderStageSelector;
+        use dynamo_kv_router::coordination::{
+            AggregatedPolicy, AttemptId, HostAction, HostEvent, InvocationId, PromptInputView,
+            RoutingCoordinator, StageProfiles, Topology,
+        };
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let client = distributed
+            .namespace("encoder-stage-selector".to_string())
+            .unwrap()
+            .component("encoders".to_string())
+            .unwrap()
+            .endpoint("encode")
+            .client()
+            .await
+            .unwrap();
+        let router = PushRouter::<PreprocessedRequest, Annotated<LLMEngineOutput>>::from_client(
+            client,
+            RouterMode::RoundRobin,
+        )
+        .await
+        .unwrap();
+        router
+            .client
+            .override_discovered_instances(vec![31, 32, 33]);
+        router.client.override_instance_avail(vec![31, 32, 33]);
+        let router = Arc::new(router);
+        let selector = EncoderStageSelector::new(Arc::clone(&router), PoolRef::new("encode", 1));
+        let profiles = StageProfiles::for_worker_type(WorkerType::Encode);
+        let restrictions = SelectionRestrictions::default();
+        let settings = RequestSettings::default();
+        let stage = StageId::ENCODE;
+        let tokens = [1u32, 2, 3];
+        let input = |attempt: u32| SelectionInput {
+            request_id: "enc",
+            stage: &stage,
+            invocation: InvocationId::new(1),
+            attempt: AttemptId::new(attempt),
+            prompt: PromptInputView {
+                token_ids: &tokens,
+                block_mm_infos: None,
+                lora_name: None,
+                cache_namespace: None,
+            },
+            profile: profiles.default_profile(),
+            restrictions: &restrictions,
+            settings: &settings,
+        };
+
+        // Preview, then admit: the same worker, and the cursor advanced once.
+        let preview = selector.preview(input(0)).await.unwrap();
+        let first = selector
+            .admit(input(0), AdmissionTarget::FromPreview(preview.clone()))
+            .await
+            .unwrap();
+        assert_eq!(first.target.worker, preview.target.worker);
+        assert!(!first.lease().is_tracked(), "encode reserves nothing");
+        let second = selector
+            .admit(input(1), AdmissionTarget::AnyEligible)
+            .await
+            .unwrap();
+        let third = selector
+            .admit(input(2), AdmissionTarget::AnyEligible)
+            .await
+            .unwrap();
+        let mut seen = vec![
+            first.target.worker.worker_id,
+            second.target.worker.worker_id,
+            third.target.worker.worker_id,
+        ];
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![31, 32, 33],
+            "three admissions visit every worker once"
+        );
+
+        // An exclusion skips the router's cursor and picks a permitted worker.
+        let excluded = SelectionRestrictions {
+            excluded_worker_ids: HashSet::from([31, 32]),
+            ..SelectionRestrictions::default()
+        };
+        let restricted = SelectionInput {
+            restrictions: &excluded,
+            ..input(3)
+        };
+        let reservation = selector
+            .admit(restricted, AdmissionTarget::AnyEligible)
+            .await
+            .unwrap();
+        assert_eq!(reservation.target.worker.worker_id, 33);
+
+        // The single-stage topology the encoder hop runs.
+        let coordinator = RoutingCoordinator::new(
+            Topology::single(StageId::ENCODE),
+            [StageBinding::new(
+                StageId::ENCODE,
+                PoolRef::new("encode", 1),
+                WorkerType::Encode,
+                Arc::new(EncoderStageSelector::new(router, PoolRef::new("encode", 1))),
+            )],
+            Arc::new(|_| Box::new(AggregatedPolicy::for_stage(StageId::ENCODE))),
+        )
+        .unwrap();
+        let request = routing_request_for(&request(), "enc-2", None).with_encode_input(true);
+        let mut session = coordinator
+            .start(request, PlanningMode::Progressive)
+            .unwrap();
+        let HostAction::Execute(ready) = coordinator
+            .advance(&mut session, HostEvent::Continue)
+            .await
+            .unwrap()
+        else {
+            panic!("encode must be ready immediately");
+        };
+        assert_eq!(ready.stage, StageId::ENCODE);
+        assert!(matches!(
+            coordinator
+                .advance(
+                    &mut session,
+                    HostEvent::Dispatched {
+                        stage: StageId::ENCODE,
+                        attempt: ready.attempt
+                    }
+                )
+                .await
+                .unwrap(),
+            HostAction::Complete
+        ));
+
+        runtime.shutdown();
+    }
 }
