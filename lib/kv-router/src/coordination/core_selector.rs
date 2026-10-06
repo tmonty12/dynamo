@@ -406,6 +406,15 @@ impl CoreBooking {
         &self.selection_id
     }
 
+    /// Hand the booking to a host that will address it by id: the owner stops
+    /// guarding it, and the host must call `free_reservation` itself (or let
+    /// the core's expiry reap it).
+    #[must_use = "the caller now owns the reservation and must free it by id"]
+    pub fn into_selection_id(mut self) -> String {
+        self.released = true;
+        std::mem::take(&mut self.selection_id)
+    }
+
     /// Record that the worker finished prefill for this booking. A booking
     /// that was already freed is not an error.
     pub async fn prefill_complete(&self) -> Result<(), CoordinationError> {

@@ -78,19 +78,37 @@ impl Selector {
         cfg: &EppStandaloneConfig,
         policy_registry: WorkerSelectionPolicyRegistry,
     ) -> Result<Self> {
-        let kv_router_config =
-            try_kv_router_config_from_dynamo_env().map_err(anyhow::Error::msg)?;
-        Self::new_with_kv_router_config(cfg, kv_router_config, policy_registry).await
+        Self::new_for_role(cfg, policy_registry, WorkerType::Aggregated).await
     }
 
-    async fn new_with_kv_router_config(
+    /// A selector whose scheduler serves one worker role. The decode pool of
+    /// a disaggregated deployment is `Decode`, its prefill pool `Prefill`; a
+    /// single pool is `Aggregated`.
+    pub async fn new_for_role(
+        cfg: &EppStandaloneConfig,
+        policy_registry: WorkerSelectionPolicyRegistry,
+        worker_type: WorkerType,
+    ) -> Result<Self> {
+        let kv_router_config =
+            try_kv_router_config_from_dynamo_env().map_err(anyhow::Error::msg)?;
+        Self::new_with_kv_router_config(cfg, kv_router_config, policy_registry, worker_type).await
+    }
+
+    /// The embedded selection core, for callers that select through the
+    /// stage coordinator rather than this selector's request API.
+    pub fn core(&self) -> &Arc<dynamo_kv_router::services::selection::SelectionCore> {
+        self.service.core()
+    }
+
+    pub(crate) async fn new_with_kv_router_config(
         cfg: &EppStandaloneConfig,
         kv_router_config: KvRouterConfig,
         policy_registry: WorkerSelectionPolicyRegistry,
+        worker_type: WorkerType,
     ) -> Result<Self> {
         Self::validate_queueing_worker_capacity(cfg, &kv_router_config)?;
 
-        warn_for_unserved_worker_selection_policies(&kv_router_config, &[WorkerType::Aggregated])?;
+        warn_for_unserved_worker_selection_policies(&kv_router_config, &[worker_type])?;
         let peer_replication = cfg.peer_replication.as_ref();
         let peer_client = if peer_replication.is_some() {
             Some(
@@ -112,7 +130,7 @@ impl Selector {
 
         let mut builder = SelectionServiceBuilder::new(
             kv_router_config,
-            WorkerType::Aggregated,
+            worker_type,
             policy_registry.with_default_factory(dynamo_custom_policy_builtin::default_factory()),
         )
         .indexer_threads(cfg.selector_threads);
@@ -348,6 +366,7 @@ models:
             selector_threads: 1,
             peer_replication: None,
             inference_pool_name: "test-pool".to_string(),
+            prefill_inference_pool_name: None,
             namespace: "test-ns".to_string(),
             model_name: "test-model".to_string(),
             tokenizer_service_url: "http://vllm-render:8000".to_string(),
@@ -513,6 +532,7 @@ worker_selection:
             &test_config(),
             router_config_with_policy(&policy_file),
             registry,
+            WorkerType::Aggregated,
         )
         .await
         .expect("custom selection service should build");
@@ -714,6 +734,7 @@ worker_selection:
             &cfg,
             router_config_with_policy(&policy_file),
             WorkerSelectionPolicyRegistry::default(),
+            WorkerType::Aggregated,
         )
         .await
         .err()
@@ -737,6 +758,7 @@ worker_selection:
             &cfg,
             router_config_with_policy(&policy_file),
             WorkerSelectionPolicyRegistry::default(),
+            WorkerType::Aggregated,
         )
         .await
         .expect("threshold-free model should allow missing capacity");
@@ -807,6 +829,7 @@ worker_selection:
                 ..Default::default()
             },
             registry,
+            WorkerType::Aggregated,
         )
         .await
         .expect("selector should build");
@@ -842,6 +865,7 @@ worker_selection:
             &cfg,
             router_config_with_policy(&policy_file),
             WorkerSelectionPolicyRegistry::default(),
+            WorkerType::Aggregated,
         )
         .await
         .expect("selector should build");

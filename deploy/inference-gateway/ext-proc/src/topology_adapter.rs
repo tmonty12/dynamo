@@ -138,6 +138,7 @@ mod tests {
             selector_threads: 1,
             peer_replication: None,
             inference_pool_name: "test-pool".to_string(),
+            prefill_inference_pool_name: None,
             namespace: "test-ns".to_string(),
             model_name: "Qwen/Qwen3-0.6B".to_string(),
             tokenizer_service_url: "http://vllm-render:8000".to_string(),

@@ -8,14 +8,18 @@
 //! Instead it composes:
 //!
 //! - a [`RenderClient`] that tokenizes prompts via a render sidecar,
-//! - a [`PodDiscovery`] that discovers Ready worker pods from Kubernetes,
-//! - a [`TopologyAdapter`] that registers those pods into the selector, and
-//! - a [`Selector`] (in-process, runtime-free selection service) that picks a
-//!   worker.
+//! - one [`PodDiscovery`] per `InferencePool` that discovers Ready worker pods
+//!   from Kubernetes (the decode pool the `HTTPRoute` targets and, when
+//!   configured, a prefill pool),
+//! - a [`TopologyAdapter`] per pool that registers those pods into its
+//!   [`Selector`] (in-process, runtime-free selection service), and
+//! - a `RoutingCoordinator` that plans every stage of a request over those
+//!   selectors and books each one before the request leaves the EPP.
 //!
-//! On each request it tokenizes the prompt, asks the selection service for a
-//! worker constrained to the currently-Ready pods, and tells Envoy where to send
-//! the request via routing headers.
+//! On each request it tokenizes the prompt, plans and books the stages, and
+//! tells Envoy where to send the request: the decode destination, plus
+//! `x-prefiller-host-port` naming the prefill worker for the decode-side
+//! sidecar when a prefill pool is configured.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -26,7 +30,15 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::Semaphore;
 
-use dynamo_kv_router::services::selection::{SelectionError, WorkerSelectionPolicyRegistry};
+use dynamo_kv_router::coordination::{
+    AggregatedPolicy, AttemptId, CoordinationError, CoreAdmissionMode, CoreBooking,
+    CoreStageSelector, DelegatedPlan, PoolRef, PrefillDecodePolicy, PromptInput, RequestSettings,
+    RoutingCoordinator, RoutingRequest, SelectionRestrictions, StageBinding, StageId,
+    StageSelector, Topology, reservation_id,
+};
+use dynamo_kv_router::identity::RoutingPartitionId;
+use dynamo_kv_router::services::selection::WorkerSelectionPolicyRegistry;
+use dynamo_kv_router::{DEFAULT_ROUTING_GROUP, SessionContext, WorkerType};
 use dynamo_llm::http::service::metadata::extract_metadata_from_header_pairs;
 use dynamo_llm::protocols::agents::HEADER_DYNAMO_SESSION_ID;
 use dynamo_llm::protocols::common::extensions::{
@@ -41,7 +53,7 @@ use crate::picker::{
 };
 use crate::pod_discovery::PodDiscovery;
 use crate::render_http::RenderError;
-use crate::selector::{SelectRequest, Selector};
+use crate::selector::Selector;
 use crate::sglang_renderer_client::SglangRendererClient;
 use crate::topology_adapter::{RegistrationDefaults, TopologyAdapter};
 use crate::vllm_render_client::VllmRenderClient;
@@ -74,15 +86,175 @@ impl RenderClient {
     }
 }
 
+/// One worker pool: its selector, the reflector that resolves its pods, and
+/// the reconcile loop that keeps the two in step.
+struct Pool {
+    selector: Arc<Selector>,
+    reflector: Arc<PodDiscovery>,
+    // Kept alive for the lifetime of the router; the reconcile loop runs on it.
+    _adapter: TopologyAdapter,
+    ready: Arc<AtomicBool>,
+}
+
+impl Pool {
+    async fn spawn(
+        cfg: &EppStandaloneConfig,
+        pool_name: &str,
+        policy_registry: WorkerSelectionPolicyRegistry,
+        worker_type: WorkerType,
+    ) -> Result<Self> {
+        let selector = Arc::new(Selector::new_for_role(cfg, policy_registry, worker_type).await?);
+        let (reflector, ready) = PodDiscovery::spawn_for_pool(cfg, pool_name).await?;
+        let reflector = Arc::new(reflector);
+        let adapter = TopologyAdapter::spawn(
+            reflector.as_ref().clone(),
+            selector.clone(),
+            RegistrationDefaults::from_config(cfg),
+        );
+        Ok(Self {
+            selector,
+            reflector,
+            _adapter: adapter,
+            ready,
+        })
+    }
+}
+
+/// A coordinator stage selector over one pool's embedded selection core.
+/// Admissions are booked by id so the lifecycle callbacks can address them.
+fn stage_selector(selector: &Selector, pool: &str, model_name: &str) -> Arc<dyn StageSelector> {
+    Arc::new(CoreStageSelector::new(
+        Arc::clone(selector.core()),
+        RoutingPartitionId::new(model_name, DEFAULT_ROUTING_GROUP),
+        PoolRef::new(pool.to_string(), 1),
+        CoreAdmissionMode::Book,
+    ))
+}
+
+/// Which stages a request's plan booked, by the ids the lifecycle callbacks
+/// address them with. The decode pool booking is `decode` on the
+/// disaggregated path and `aggregated` on the fallback; both are tried.
+fn stage_booking_id(key: &str, stage: &StageId) -> String {
+    reservation_id(key, stage, AttemptId::FIRST)
+}
+
+/// Whether a disaggregated plan failed only because prefill could not be
+/// selected, so the request can still be served by the decode pool alone.
+fn falls_back_to_aggregated(error: &CoordinationError) -> bool {
+    match error {
+        CoordinationError::NoEligibleWorkers { stage, .. }
+        | CoordinationError::AdmissionRejected { stage, .. } => *stage == StageId::PREFILL,
+        _ => false,
+    }
+}
+
+/// The two coordinators a standalone EPP plans with. `disaggregated` exists
+/// only when a prefill pool is configured.
+fn build_coordinators(
+    model_name: &str,
+    decode: &Selector,
+    prefill: Option<&Selector>,
+) -> Result<(RoutingCoordinator, Option<RoutingCoordinator>)> {
+    let aggregated = RoutingCoordinator::new(
+        Topology::aggregated(),
+        [StageBinding::new(
+            StageId::AGGREGATED,
+            PoolRef::new("decode", 1),
+            WorkerType::Aggregated,
+            stage_selector(decode, "decode", model_name),
+        )],
+        Arc::new(|_| Box::new(AggregatedPolicy::new())),
+    )?;
+    let disaggregated = prefill
+        .map(|prefill| {
+            RoutingCoordinator::new(
+                Topology::prefill_decode(),
+                [
+                    StageBinding::new(
+                        StageId::PREFILL,
+                        PoolRef::new("prefill", 1),
+                        WorkerType::Prefill,
+                        stage_selector(prefill, "prefill", model_name),
+                    ),
+                    StageBinding::new(
+                        StageId::DECODE,
+                        PoolRef::new("decode", 1),
+                        WorkerType::Decode,
+                        stage_selector(decode, "decode", model_name),
+                    ),
+                ],
+                Arc::new(|_| Box::new(PrefillDecodePolicy::prefill_first())),
+            )
+        })
+        .transpose()?;
+    Ok((aggregated, disaggregated))
+}
+
+/// A planned request as the picker returns it: workers by stage, with every
+/// booking handed over to id-addressed ownership.
+struct AdoptedPlan {
+    decode_worker_id: u64,
+    prefill_worker_id: Option<u64>,
+}
+
+/// Plan a request: the disaggregated coordinator first, falling back to the
+/// aggregated one when prefill alone cannot be selected.
+async fn plan_request(
+    disaggregated: Option<&RoutingCoordinator>,
+    aggregated: &RoutingCoordinator,
+    request: impl Fn() -> RoutingRequest,
+) -> Result<DelegatedPlan, CoordinationError> {
+    if let Some(disaggregated) = disaggregated {
+        match disaggregated.plan_all(request()).await {
+            Ok(plan) => return Ok(plan),
+            Err(error) if falls_back_to_aggregated(&error) => {
+                tracing::debug!(
+                    %error,
+                    "Prefill pool could not serve the request; routing to the decode pool alone"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    aggregated.plan_all(request()).await
+}
+
+/// Hand every booking in `plan` to id-addressed ownership: the lifecycle
+/// callbacks free them by [`stage_booking_id`], so no per-request map is kept.
+fn adopt_plan(plan: DelegatedPlan) -> Result<AdoptedPlan> {
+    let mut decode_worker_id = None;
+    let mut prefill_worker_id = None;
+    for stage in plan.stages {
+        let (target, _, lease) = stage.reservation.into_parts();
+        let booking = lease.into_owner::<CoreBooking>().map_err(|_| {
+            anyhow::anyhow!(
+                "stage {} was not reserved through the embedded selection core",
+                target.stage
+            )
+        })?;
+        let _selection_id = booking.into_selection_id();
+        if target.stage == StageId::PREFILL {
+            prefill_worker_id = Some(target.worker.worker_id);
+        } else {
+            decode_worker_id = Some(target.worker.worker_id);
+        }
+    }
+    Ok(AdoptedPlan {
+        decode_worker_id: decode_worker_id
+            .ok_or_else(|| anyhow::anyhow!("plan has no decode or aggregated stage"))?,
+        prefill_worker_id,
+    })
+}
+
 /// Standalone endpoint picker backed by the standalone selection service.
 pub struct EppRouter {
     renderer: RenderClient,
-    reflector: Arc<PodDiscovery>,
-    selector: Arc<Selector>,
-    // Kept alive for the lifetime of the router; the reconcile loop runs on it.
-    _adapter: TopologyAdapter,
-    reflector_ready: Arc<AtomicBool>,
-    model_name: String,
+    /// The pool the `HTTPRoute` targets; every response streams from here.
+    decode: Pool,
+    /// Prefill workers named to the decode-side sidecar; `None` runs aggregated.
+    prefill: Option<Pool>,
+    aggregated: RoutingCoordinator,
+    disaggregated: Option<RoutingCoordinator>,
     /// Bounds total concurrent in-flight `pick()`s. HTTP/2 stream multiplexing
     /// means the TCP-connection cap (`MAX_CONCURRENT_CONNECTIONS`) does NOT bound
     /// requests, so without this a burst could fan out unbounded tokenizer/render
@@ -107,7 +279,6 @@ impl EppRouter {
         cfg: EppStandaloneConfig,
         policy_registry: WorkerSelectionPolicyRegistry,
     ) -> Result<Self> {
-        let selector = Arc::new(Selector::new(&cfg, policy_registry).await?);
         let timeout = Duration::from_millis(cfg.tokenization_timeout_ms);
         let max_response_bytes = cfg.tokenizer_max_response_bytes;
         let renderer = match cfg.renderer_protocol {
@@ -122,30 +293,64 @@ impl EppRouter {
                 max_response_bytes,
             )?),
         };
-        let (reflector, reflector_ready) = PodDiscovery::spawn(&cfg).await?;
-        let reflector = Arc::new(reflector);
-        let defaults = RegistrationDefaults::from_config(&cfg);
-        let adapter =
-            TopologyAdapter::spawn(reflector.as_ref().clone(), selector.clone(), defaults);
+        let prefill = match &cfg.prefill_inference_pool_name {
+            Some(pool_name) => {
+                // Prefill admission is local to this replica: the prefill pool's
+                // selector does not join the decode pool's replica sync.
+                let mut prefill_cfg = cfg.clone();
+                prefill_cfg.peer_replication = None;
+                Some(
+                    Pool::spawn(
+                        &prefill_cfg,
+                        pool_name,
+                        policy_registry.clone(),
+                        WorkerType::Prefill,
+                    )
+                    .await?,
+                )
+            }
+            None => None,
+        };
+        let decode_role = if prefill.is_some() {
+            WorkerType::Decode
+        } else {
+            WorkerType::Aggregated
+        };
+        let decode =
+            Pool::spawn(&cfg, &cfg.inference_pool_name, policy_registry, decode_role).await?;
+        let (aggregated, disaggregated) = build_coordinators(
+            &cfg.model_name,
+            &decode.selector,
+            prefill.as_ref().map(|pool| pool.selector.as_ref()),
+        )?;
+        tracing::info!(
+            decode_pool = %cfg.inference_pool_name,
+            prefill_pool = ?cfg.prefill_inference_pool_name,
+            "Initialized standalone EPP routing"
+        );
 
         // Readiness is driven solely by the live pod+pool signal (see `is_ready`);
         // we do not block startup on a schedulable worker. A valid, empty pool is
         // ready immediately and returns 503 per-request until capacity appears.
         Ok(Self {
             renderer,
-            reflector,
-            selector,
-            _adapter: adapter,
-            reflector_ready,
-            model_name: cfg.model_name,
+            decode,
+            prefill,
+            aggregated,
+            disaggregated,
             inflight: Arc::new(Semaphore::new(cfg.max_inflight_requests)),
         })
     }
 
-    /// Overall EPP readiness for the gRPC health signal: the pod reflector has
-    /// synced workers and resolved its InferencePool. Polled by the health mirror in `main`.
+    /// Overall EPP readiness for the gRPC health signal: every pod reflector
+    /// has synced workers and resolved its InferencePool. Polled by the health
+    /// mirror in `main`.
     pub fn is_ready(&self) -> bool {
-        self.reflector_ready.load(Ordering::Acquire)
+        self.decode.ready.load(Ordering::Acquire)
+            && self
+                .prefill
+                .as_ref()
+                .is_none_or(|prefill| prefill.ready.load(Ordering::Acquire))
     }
 
     /// Tokenize a chat body and resolve its routing inputs.
@@ -206,7 +411,7 @@ impl EppRouter {
             .filter_map(|candidate| candidate.parse().ok())
             .collect();
         // Single index pass; the predicate borrows each endpoint (no clone).
-        self.reflector.ready_worker_ids_matching(|endpoint| {
+        self.decode.reflector.ready_worker_ids_matching(|endpoint| {
             endpoint_in_subset(endpoint, &candidates, &candidate_ips)
         })
     }
@@ -269,13 +474,13 @@ impl EndpointPicker for EppRouter {
         req: &RequestInfo,
         _endpoints: &[Endpoint],
     ) -> Result<PickResult, PickError> {
-        if !self.reflector_ready.load(Ordering::Acquire) {
+        if !self.is_ready() {
             return Err(PickError::RoutingFailed(
                 "pod reflector cache not ready".to_string(),
             ));
         }
 
-        if !self.reflector.has_ready_workers() {
+        if !self.decode.reflector.has_ready_workers() {
             return Err(PickError::NoEndpoints);
         }
 
@@ -325,11 +530,13 @@ impl EndpointPicker for EppRouter {
             let endpoint = match &allowed {
                 Some(ids) => {
                     let worker_id = *ids.iter().next().ok_or(PickError::NoEndpoints)?;
-                    self.reflector
+                    self.decode
+                        .reflector
                         .resolve_endpoint(worker_id)
                         .ok_or(PickError::NoEndpoints)?
                 }
                 None => self
+                    .decode
                     .reflector
                     .resolve_any_endpoint()
                     .ok_or(PickError::NoEndpoints)?,
@@ -352,63 +559,123 @@ impl EndpointPicker for EppRouter {
             .map_err(|e| e.into_pick_error(&req.request_id))?;
         let policy_class = requested_policy_class(&req.headers)?;
 
-        // EPP-minted booking key (not the reused `x-request-id`): stays
-        // EPP-known/releasable and rides back on `PickResult::reservation_id`,
-        // so the server frees it via the callbacks without a shared map.
+        // EPP-minted booking key (not the reused `x-request-id`): each stage's
+        // booking is `reservation_id(key, stage, attempt)`, so the lifecycle
+        // callbacks address every booking from the key alone, no shared map.
         let reservation_id = uuid::Uuid::new_v4().to_string();
 
-        // Free the booking if this pick is dropped before it is adopted — the
-        // ext-proc stream can close after the scheduler booked but before the
-        // server stores `booking_id`, and a booked (past-queue) reservation is not
-        // reclaimed by the queue's drop-retraction. Disarmed on the handled paths
-        // below; until then, dropping this future frees the reservation.
-        let mut reservation_guard =
-            ReservationGuard::new(self.selector.clone(), reservation_id.clone());
-
-        let select_req = SelectRequest {
-            model_name: self.model_name.clone(),
-            reservation_id: reservation_id.clone(),
-            token_ids: tokens,
-            session_id: first_header(&req.headers, HEADER_DYNAMO_SESSION_ID).map(str::to_owned),
+        let shared_tokens = Arc::new(tokens);
+        let session_id = first_header(&req.headers, HEADER_DYNAMO_SESSION_ID).map(str::to_owned);
+        let routing_request = || {
+            let prompt = PromptInput {
+                token_ids: Arc::clone(&shared_tokens),
+                block_mm_infos: None,
+                lora_name: None,
+                cache_namespace: cache_namespace.clone(),
+            };
             // `None` on the ordinary path: the selector schedules over its
-            // catalog; `Some` only carries an Envoy subset constraint.
-            allowed_worker_ids: allowed,
-            // Effective header-over-body values; `None` only when unset everywhere.
-            priority_jump,
-            strict_priority,
-            expected_output_tokens,
-            policy_class,
-            cache_namespace: cache_namespace.clone(),
+            // catalog; `Some` only carries an Envoy subset constraint, and only
+            // for the decode pool the subset describes.
+            let decode_restrictions = SelectionRestrictions {
+                allowed_worker_ids: allowed.clone(),
+                ..SelectionRestrictions::default()
+            };
+            RoutingRequest::new(&reservation_id, prompt)
+                .with_settings(RequestSettings {
+                    // Effective header-over-body values; defaults only when unset everywhere.
+                    priority_jump: priority_jump.unwrap_or_default(),
+                    strict_priority: strict_priority.unwrap_or(0),
+                    policy_class: policy_class.clone(),
+                    session_context: session_id
+                        .clone()
+                        .map(|session_id| SessionContext::new(session_id, None, None, None)),
+                    expected_output_tokens,
+                    router_config_override: None,
+                })
+                .with_stage_restrictions(StageId::DECODE, decode_restrictions.clone())
+                .with_stage_restrictions(StageId::AGGREGATED, decode_restrictions)
         };
 
-        // On either error return below the guard (still armed) frees the booking.
-
-        let resp = match self.selector.select_and_reserve(select_req).await {
-            Ok(resp) => resp,
-            Err(SelectionError::BadRequest(message)) => {
-                return Err(PickError::InvalidRequest(message));
+        // Until the plan is adopted below it owns every booking: dropping this
+        // future (the ext-proc stream closed after the scheduler booked) frees
+        // them. Adoption is synchronous, so nothing can slip between it and the
+        // server storing `booking_id`.
+        let plan = match plan_request(
+            self.disaggregated.as_ref(),
+            &self.aggregated,
+            routing_request,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(CoordinationError::Selector(error))
+                if error
+                    .downcast_ref::<dynamo_kv_router::services::selection::SelectionError>()
+                    .is_some_and(|error| {
+                        matches!(
+                            error,
+                            dynamo_kv_router::services::selection::SelectionError::BadRequest(_)
+                        )
+                    }) =>
+            {
+                return Err(PickError::InvalidRequest(error.to_string()));
             }
-            Err(e) => return Err(PickError::RoutingFailed(e.to_string())),
+            Err(error) => return Err(PickError::RoutingFailed(error.to_string())),
         };
 
-        // The reflector owns the address + readiness. If it can no longer resolve
-        // the selected worker, the pod left Ready in the race, so the selection is
-        // stale: refuse rather than route to a stale address.
-        let Some(endpoint) = self.reflector.resolve_endpoint(resp.worker_id) else {
+        // The reflectors own addresses and readiness. If one can no longer
+        // resolve a selected worker, that pod left Ready in the race, so the
+        // selection is stale: refuse rather than route to a stale address.
+        let decode_stage = plan
+            .stage(&StageId::DECODE)
+            .or_else(|| plan.stage(&StageId::AGGREGATED))
+            .ok_or_else(|| PickError::RoutingFailed("plan has no decode stage".to_string()))?;
+        let Some(endpoint) = self
+            .decode
+            .reflector
+            .resolve_endpoint(decode_stage.target.worker.worker_id)
+        else {
             tracing::warn!(
-                worker_id = resp.worker_id,
+                worker_id = decode_stage.target.worker.worker_id,
                 "Selected worker no longer resolvable in reflector; treating selection as stale"
             );
+            plan.release_all().await.ok();
             return Err(PickError::NoEndpoints);
+        };
+        let selected_prefill_endpoint = match (plan.stage(&StageId::PREFILL), &self.prefill) {
+            (Some(prefill_stage), Some(prefill)) => {
+                let Some(prefill_endpoint) = prefill
+                    .reflector
+                    .resolve_endpoint(prefill_stage.target.worker.worker_id)
+                else {
+                    tracing::warn!(
+                        worker_id = prefill_stage.target.worker.worker_id,
+                        "Selected prefill worker no longer resolvable in reflector; treating selection as stale"
+                    );
+                    plan.release_all().await.ok();
+                    return Err(PickError::NoEndpoints);
+                };
+                Some(prefill_endpoint)
+            }
+            _ => None,
         };
 
         // Success: the caller adopts `reservation_id` synchronously (there is no
         // await between this return and the server storing `booking_id`), so the
-        // lifecycle callbacks now own the free — disarm the guard.
-        reservation_guard.disarm();
+        // lifecycle callbacks now own every booking by id.
+        let adopted = adopt_plan(plan).map_err(|e| PickError::RoutingFailed(e.to_string()))?;
+        tracing::debug!(
+            reservation_id = %reservation_id,
+            decode_worker_id = adopted.decode_worker_id,
+            prefill_worker_id = ?adopted.prefill_worker_id,
+            endpoint = %endpoint,
+            prefill_endpoint = ?selected_prefill_endpoint,
+            "Picked standalone endpoint"
+        );
 
         // Routing comes from the destination mutation; aggregated raw workers
-        // read no `x-dynamo-*` headers. (Disaggregated will add its own contract.)
+        // read no `x-dynamo-*` headers. A disaggregated plan names the prefill
+        // worker in `x-prefiller-host-port` for the decode-side sidecar.
         Ok(PickResult {
             endpoint,
             // Worker re-tokenizes the forwarded request (llm-d parity); no inject.
@@ -416,78 +683,58 @@ impl EndpointPicker for EppRouter {
             cache_namespace,
             // Native vLLM has no Dynamo handler to tag the salt; the EPP does.
             cache_salt_forwarding: CacheSaltForwarding::NativeVllm,
-            // Booking id for the server's lifecycle callbacks (no shared map).
+            selected_prefill_endpoint,
+            // Booking key for the server's lifecycle callbacks (no shared map).
             reservation_id: Some(reservation_id),
             ..Default::default()
         })
     }
 
-    /// Response complete: release the booking from `pick`. `booking_id` is that
-    /// reservation id; `free_reservation` is idempotent (body-less pick → no-op).
+    /// Response complete: release every booking from `pick`. `booking_id` is
+    /// that pick's reservation key; `free_reservation` is idempotent (a
+    /// body-less pick booked nothing, and the fallback plan has no prefill).
     async fn on_request_complete(&self, booking_id: &str) {
-        if let Err(e) = self.selector.free_reservation(booking_id).await {
-            tracing::warn!(reservation_id = booking_id, error = %e, "Failed to free reservation");
+        if let Some(prefill) = &self.prefill
+            && let Err(e) = prefill
+                .selector
+                .free_reservation(&stage_booking_id(booking_id, &StageId::PREFILL))
+                .await
+        {
+            tracing::warn!(reservation_id = booking_id, error = %e, "Failed to free prefill reservation");
         }
-    }
-
-    /// First token: release prefill load, keep decode booked until completion.
-    /// `booking_id` is `pick`'s reservation id; `prefill_complete` is idempotent.
-    async fn on_prefill_complete(&self, booking_id: &str) {
-        if let Err(e) = self.selector.prefill_complete(booking_id).await {
-            tracing::warn!(reservation_id = booking_id, error = %e, "Failed to mark prefill complete");
-        }
-    }
-}
-
-/// Releases a minted reservation when its [`ReservationGuard`] fires. The
-/// production impl (`Arc<Selector>`) spawns the idempotent `free_reservation`;
-/// tests use a lightweight stub. Kept a monomorphized trait so the guard is a
-/// plain struct — no per-request `Box<dyn FnOnce>` allocation on the hot path.
-trait ReservationReleaser: Send + 'static {
-    fn release(&self, reservation_id: String);
-}
-
-impl ReservationReleaser for Arc<Selector> {
-    fn release(&self, reservation_id: String) {
-        let selector = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = selector.free_reservation(&reservation_id).await {
-                tracing::debug!(%reservation_id, error = %e, "reservation cleanup on dropped pick");
+        for stage in [StageId::DECODE, StageId::AGGREGATED] {
+            if let Err(e) = self
+                .decode
+                .selector
+                .free_reservation(&stage_booking_id(booking_id, &stage))
+                .await
+            {
+                tracing::warn!(reservation_id = booking_id, error = %e, "Failed to free reservation");
             }
-        });
-    }
-}
-
-/// RAII cleanup for a minted reservation. Armed when `reservation_id` is minted;
-/// if the pick future is dropped before the result is adopted (ext-proc stream
-/// closed after a booking), `Drop` releases it (an idempotent `free_reservation`).
-/// Disarmed once the pick is handled, so a successful, adopted pick or an error
-/// return does not double-free. Holds the releaser + id by value (no boxing).
-struct ReservationGuard<R: ReservationReleaser> {
-    releaser: R,
-    reservation_id: String,
-    armed: bool,
-}
-
-impl<R: ReservationReleaser> ReservationGuard<R> {
-    fn new(releaser: R, reservation_id: String) -> Self {
-        Self {
-            releaser,
-            reservation_id,
-            armed: true,
         }
     }
 
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl<R: ReservationReleaser> Drop for ReservationGuard<R> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.releaser
-                .release(std::mem::take(&mut self.reservation_id));
+    /// First token: the prefill worker is done, so free its booking; release
+    /// the decode booking's prefill load and keep its decode load until
+    /// completion. `prefill_complete` is idempotent.
+    async fn on_prefill_complete(&self, booking_id: &str) {
+        if let Some(prefill) = &self.prefill
+            && let Err(e) = prefill
+                .selector
+                .free_reservation(&stage_booking_id(booking_id, &StageId::PREFILL))
+                .await
+        {
+            tracing::warn!(reservation_id = booking_id, error = %e, "Failed to free prefill reservation");
+        }
+        for stage in [StageId::DECODE, StageId::AGGREGATED] {
+            if let Err(e) = self
+                .decode
+                .selector
+                .prefill_complete(&stage_booking_id(booking_id, &stage))
+                .await
+            {
+                tracing::warn!(reservation_id = booking_id, error = %e, "Failed to mark prefill complete");
+            }
         }
     }
 }
@@ -542,6 +789,194 @@ impl TokenizeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod planning {
+        use std::collections::HashMap;
+
+        use dynamo_kv_router::config::KvRouterConfig;
+        use dynamo_kv_router::services::selection::{CatalogReconciler, WorkerRequest};
+
+        use super::super::*;
+        use crate::epp_standalone_config::{EppStandaloneConfig, RendererProtocol};
+
+        fn config() -> EppStandaloneConfig {
+            EppStandaloneConfig {
+                selector_threads: 1,
+                peer_replication: None,
+                inference_pool_name: "decode-pool".to_string(),
+                prefill_inference_pool_name: Some("prefill-pool".to_string()),
+                namespace: "test-ns".to_string(),
+                model_name: "test-model".to_string(),
+                tokenizer_service_url: "http://vllm-render:8000".to_string(),
+                renderer_protocol: RendererProtocol::VllmRender,
+                tokenizer_max_response_bytes: 16 * 1024 * 1024,
+                tokenization_timeout_ms: 5_000,
+                block_size: 16,
+                data_parallel_size: 1,
+                kv_event_port_stride: 1,
+                kv_event_port: 5557,
+                replay_port: None,
+                total_kv_blocks: None,
+                max_num_batched_tokens: Some(8192),
+                max_inflight_requests: 1024,
+                session_affinity_ttl_secs: None,
+            }
+        }
+
+        fn worker(worker_id: u64) -> WorkerRequest {
+            WorkerRequest {
+                worker_id,
+                model_name: "test-model".to_string(),
+                endpoint: Some(format!("http://10.0.0.{worker_id}:8000")),
+                block_size: Some(16),
+                data_parallel_start_rank: Some(0),
+                data_parallel_size: Some(1),
+                kv_events_endpoints: HashMap::from([(
+                    0u32,
+                    format!("tcp://127.0.0.1:{}", 46_000 + worker_id),
+                )]),
+                ..Default::default()
+            }
+        }
+
+        async fn selector(role: WorkerType, workers: &[u64]) -> Selector {
+            let selector = Selector::new_with_kv_router_config(
+                &config(),
+                KvRouterConfig {
+                    use_kv_events: false,
+                    ..Default::default()
+                },
+                WorkerSelectionPolicyRegistry::default(),
+                role,
+            )
+            .await
+            .expect("selector builds");
+            let registrations: Vec<WorkerRequest> = workers.iter().copied().map(worker).collect();
+            CatalogReconciler::new(Arc::clone(selector.core()))
+                .apply(&registrations)
+                .await
+                .expect("workers register");
+            selector
+        }
+
+        fn active_requests(selector: &Selector) -> usize {
+            selector
+                .core()
+                .loads(Some("test-model"), None)
+                .into_iter()
+                .flat_map(|model| model.loads)
+                .map(|load| load.active_requests)
+                .sum()
+        }
+
+        fn request(key: &str) -> impl Fn() -> RoutingRequest + '_ {
+            move || RoutingRequest::new(key, PromptInput::from_tokens((1..=32).collect()))
+        }
+
+        #[tokio::test]
+        async fn disaggregated_plan_books_both_pools_and_callbacks_free_by_id() {
+            let decode = selector(WorkerType::Decode, &[1, 2]).await;
+            let prefill = selector(WorkerType::Prefill, &[11]).await;
+            let (aggregated, disaggregated) =
+                build_coordinators("test-model", &decode, Some(&prefill)).unwrap();
+
+            let plan = plan_request(disaggregated.as_ref(), &aggregated, request("req-1"))
+                .await
+                .unwrap();
+            assert_eq!(plan.stages.len(), 2);
+            assert_eq!(active_requests(&prefill), 1);
+            assert_eq!(active_requests(&decode), 1);
+
+            let adopted = adopt_plan(plan).unwrap();
+            assert_eq!(adopted.prefill_worker_id, Some(11));
+            assert!([1, 2].contains(&adopted.decode_worker_id));
+            // Adoption hands the bookings to id-addressed ownership: nothing
+            // was freed by dropping the plan.
+            assert_eq!(active_requests(&prefill), 1);
+            assert_eq!(active_requests(&decode), 1);
+
+            // First token: the prefill booking is freed, decode keeps running.
+            prefill
+                .free_reservation(&stage_booking_id("req-1", &StageId::PREFILL))
+                .await
+                .unwrap();
+            decode
+                .prefill_complete(&stage_booking_id("req-1", &StageId::DECODE))
+                .await
+                .unwrap();
+            // The fallback stage id is tried too and is a harmless no-op.
+            decode
+                .prefill_complete(&stage_booking_id("req-1", &StageId::AGGREGATED))
+                .await
+                .unwrap();
+            assert_eq!(active_requests(&prefill), 0);
+            assert_eq!(active_requests(&decode), 1);
+
+            // Request end.
+            decode
+                .free_reservation(&stage_booking_id("req-1", &StageId::DECODE))
+                .await
+                .unwrap();
+            assert_eq!(active_requests(&decode), 0);
+        }
+
+        #[tokio::test]
+        async fn empty_prefill_pool_falls_back_to_the_decode_pool_alone() {
+            let decode = selector(WorkerType::Decode, &[1]).await;
+            let prefill = selector(WorkerType::Prefill, &[]).await;
+            let (aggregated, disaggregated) =
+                build_coordinators("test-model", &decode, Some(&prefill)).unwrap();
+
+            let plan = plan_request(disaggregated.as_ref(), &aggregated, request("req-2"))
+                .await
+                .unwrap();
+            assert_eq!(plan.stages.len(), 1);
+            assert_eq!(plan.stages[0].stage, StageId::AGGREGATED);
+            let adopted = adopt_plan(plan).unwrap();
+            assert_eq!(adopted.prefill_worker_id, None);
+            assert_eq!(adopted.decode_worker_id, 1);
+            assert_eq!(active_requests(&decode), 1);
+            decode
+                .free_reservation(&stage_booking_id("req-2", &StageId::AGGREGATED))
+                .await
+                .unwrap();
+            assert_eq!(active_requests(&decode), 0);
+        }
+
+        #[tokio::test]
+        async fn dropping_an_unadopted_plan_frees_every_booking() {
+            let decode = selector(WorkerType::Decode, &[1]).await;
+            let prefill = selector(WorkerType::Prefill, &[11]).await;
+            let (aggregated, disaggregated) =
+                build_coordinators("test-model", &decode, Some(&prefill)).unwrap();
+            let plan = plan_request(disaggregated.as_ref(), &aggregated, request("req-3"))
+                .await
+                .unwrap();
+            assert_eq!(active_requests(&prefill) + active_requests(&decode), 2);
+            drop(plan);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while active_requests(&prefill) + active_requests(&decode) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("dropped plan frees its bookings");
+        }
+
+        #[tokio::test]
+        async fn without_a_prefill_pool_only_the_aggregated_coordinator_exists() {
+            let decode = selector(WorkerType::Aggregated, &[1]).await;
+            let (aggregated, disaggregated) =
+                build_coordinators("test-model", &decode, None).unwrap();
+            assert!(disaggregated.is_none());
+            let plan = plan_request(None, &aggregated, request("req-4"))
+                .await
+                .unwrap();
+            assert_eq!(plan.stages[0].stage, StageId::AGGREGATED);
+            plan.release_all().await.unwrap();
+            assert_eq!(active_requests(&decode), 0);
+        }
+    }
 
     #[test]
     fn requested_policy_class_uses_frontend_metadata_extraction() {
@@ -669,35 +1104,5 @@ mod tests {
         assert!(matches("[fd00::2]:8000", &["fd00::2"]));
         // A different port does not match a full-endpoint-only candidate.
         assert!(!matches("[fd00::1]:9999", &["[fd00::1]:8000"]));
-    }
-
-    #[test]
-    fn reservation_guard_frees_on_drop_unless_disarmed() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        // Small test seam: a releaser that records whether it fired.
-        struct StubReleaser(Arc<AtomicBool>);
-        impl ReservationReleaser for StubReleaser {
-            fn release(&self, _reservation_id: String) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        // Dropped while armed — the pick future cancelled after the scheduler
-        // booked but before the server adopts the result: cleanup runs.
-        let fired = Arc::new(AtomicBool::new(false));
-        {
-            let _guard = ReservationGuard::new(StubReleaser(fired.clone()), "r1".to_string());
-        }
-        assert!(fired.load(Ordering::SeqCst));
-
-        // Disarmed (successful, adopted pick): cleanup does not run.
-        let fired = Arc::new(AtomicBool::new(false));
-        {
-            let mut guard = ReservationGuard::new(StubReleaser(fired.clone()), "r1".to_string());
-            guard.disarm();
-        }
-        assert!(!fired.load(Ordering::SeqCst));
     }
 }

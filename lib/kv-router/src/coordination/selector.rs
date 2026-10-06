@@ -441,12 +441,17 @@ pub struct SelectionInput<'a> {
     pub settings: &'a RequestSettings,
 }
 
+/// The scheduler-facing id for one stage attempt's booking: unique per
+/// request, stage, and attempt, so a retry never collides with the booking it
+/// replaces and a host can address lifecycle calls without keeping a map.
+pub fn reservation_id(request_id: &str, stage: &StageId, attempt: AttemptId) -> String {
+    format!("{request_id}/{stage}/{attempt}")
+}
+
 impl SelectionInput<'_> {
-    /// The scheduler-facing id for this attempt's booking. Unique per request,
-    /// stage, and attempt, so a retry never collides with the booking it
-    /// replaces and lifecycle calls can address it.
+    /// The scheduler-facing id for this attempt's booking; see [`reservation_id`].
     pub fn reservation_id(&self) -> String {
-        format!("{}/{}/{}", self.request_id, self.stage, self.attempt)
+        reservation_id(self.request_id, self.stage, self.attempt)
     }
 
     /// The router override to apply: the caller's, layered with the profile.
