@@ -624,7 +624,10 @@ impl RoutingCoordinator {
         let reservation = self
             .bounded(binding.selector.admit(input, target))
             .await??;
-        for other in session.admitted_targets() {
+        // Collected first: the session is not `Sync`, so no borrow of it may
+        // live across the release await below.
+        let admitted: Vec<SelectedTarget> = session.admitted_targets().cloned().collect();
+        for other in &admitted {
             if let Err(error) = validate_pair(self.topology.rules(), &reservation.target, other) {
                 if let Err(release_error) = reservation.release().await {
                     tracing::warn!(%request_id, %release_error, "failed to release an incompatible selection");
@@ -756,7 +759,8 @@ impl RoutingCoordinator {
                         to_release.push(released);
                     }
                 }
-                self.release_all(session.request_id(), to_release).await;
+                let request_id = session.request_id().to_string();
+                self.release_all(&request_id, to_release).await;
                 Ok(None)
             }
         }
@@ -805,7 +809,8 @@ impl RoutingCoordinator {
             }
             // Selection is open again.
             session.finished = false;
-            self.release_all(session.request_id(), to_release).await;
+            let request_id = session.request_id().to_string();
+            self.release_all(&request_id, to_release).await;
             return Ok(None);
         }
         if let Some(state) = session.stage_state_mut(&stage) {
@@ -814,7 +819,8 @@ impl RoutingCoordinator {
             }
             state.mark_failed();
         }
-        self.release_all(session.request_id(), to_release).await;
+        let request_id = session.request_id().to_string();
+        self.release_all(&request_id, to_release).await;
         // The request cannot complete; release everything still owned.
         self.abort(session).await;
         Ok(Some(HostAction::Complete))
@@ -844,7 +850,10 @@ impl RoutingCoordinator {
     /// Release everything the session still owns and close it.
     async fn abort(&self, session: &mut RouteSession) {
         let owned = session.take_owned_reservations();
-        self.release_all(session.request_id(), owned).await;
+        // Hold no borrow of the session across the await: hosts drive the
+        // coordinator from `Send` futures and the session is not `Sync`.
+        let request_id = session.request_id().to_string();
+        self.release_all(&request_id, owned).await;
         session.closed = true;
     }
 }

@@ -22,7 +22,8 @@ use crate::protocols::BlockExtraInfo;
 /// The prompt shared by every stage of one request.
 #[derive(Debug, Clone, Default)]
 pub struct PromptInput {
-    pub token_ids: Vec<u32>,
+    /// Shared with the host's request so a long prompt is not copied per stage.
+    pub token_ids: Arc<Vec<u32>>,
     pub block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
     pub lora_name: Option<String>,
     pub cache_namespace: Option<String>,
@@ -30,6 +31,10 @@ pub struct PromptInput {
 
 impl PromptInput {
     pub fn from_tokens(token_ids: Vec<u32>) -> Self {
+        Self::from_shared_tokens(Arc::new(token_ids))
+    }
+
+    pub fn from_shared_tokens(token_ids: Arc<Vec<u32>>) -> Self {
         Self {
             token_ids,
             ..Self::default()

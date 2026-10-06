@@ -304,10 +304,13 @@ pub(crate) async fn build_preprocessed_routing_with_session_affinity_mode(
         affinity,
         load_context,
     )?;
-    if router_mode.is_kv_routing() && prefill_router.conditional_disagg_enabled() {
+    // KV-routed decode sets coordinate prefill and decode selection through
+    // the prefill router, which needs the decode host for decode admission
+    // (and for conditional disaggregation's decode preview).
+    if router_mode.is_kv_routing() {
         prefill_router
             .set_decode_routing_host(routing_host.clone())
-            .context("install conditional-disagg decode RoutingHost")?;
+            .context("install decode RoutingHost on the prefill router")?;
     }
     let backend_engine: ServiceEngine<_, _> = routing_host;
     Ok(PreprocessedRouting {
