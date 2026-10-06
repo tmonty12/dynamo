@@ -14,6 +14,9 @@ pub enum CoordinationError {
     #[error("branch {branch} is not declared by this topology")]
     UnknownBranch { branch: BranchId },
 
+    #[error("invalid topology: {0}")]
+    InvalidTopology(String),
+
     #[error("stage {stage} has no selection profile {profile}")]
     UnknownProfile {
         stage: StageId,
