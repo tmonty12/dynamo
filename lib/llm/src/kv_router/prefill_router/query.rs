@@ -42,7 +42,48 @@ impl PrefillReservation {
     }
 }
 
+impl dynamo_kv_router::coordination::ReservationOwner for PrefillReservation {
+    fn release(
+        self: Box<Self>,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<(), dynamo_kv_router::coordination::CoordinationError>,
+    > {
+        Box::pin(async move {
+            PrefillReservation::release(*self).await.map_err(|error| {
+                dynamo_kv_router::coordination::CoordinationError::Release(error.to_string())
+            })
+        })
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "prefill reservation on worker {} dp_rank {:?}",
+            self.worker.worker_id, self.dp_rank
+        )
+    }
+}
+
 impl PrefillRouter {
+    /// Published metadata for one worker of the active prefill binding, for
+    /// the coordinator's placement rules. `None` while no binding is active,
+    /// for a non-KV binding, or for an unknown worker.
+    pub(crate) fn prefill_worker_facts(
+        &self,
+        worker_id: WorkerId,
+    ) -> Option<dynamo_kv_router::coordination::WorkerFacts> {
+        let binding = self.binding.load_full()?;
+        let chooser = binding.router.kv_router_if_enabled()?;
+        let workers = chooser.workers_with_configs.borrow();
+        workers
+            .get(&worker_id)
+            .map(dynamo_kv_router::coordination::WorkerFacts::from_config)
+    }
+
     /// Select a prefill worker and reserve it when KV routing is enabled.
     ///
     /// If this future is dropped while queued, the scheduler retracts its
@@ -627,5 +668,222 @@ mod tests {
         }
 
         runtime.shutdown();
+    }
+
+    /// The coordinator adapters over the prefill router and a KV router: both
+    /// stages book through `plan_all`, lifecycle calls address the decode
+    /// booking, and releasing frees both pools.
+    #[tokio::test]
+    async fn stage_selectors_plan_book_and_release_both_pools() {
+        use dynamo_kv_router::WorkerType;
+        use dynamo_kv_router::coordination::{
+            CoordinationError, PoolRef, PrefillDecodePolicy, PromptInput, RoutingCoordinator,
+            RoutingRequest, StageBinding, StageId, Topology,
+        };
+
+        use crate::kv_router::coordination::{
+            KvRouterReservation, KvRouterStageSelector, PrefillRouterStageSelector,
+        };
+
+        async fn prefill_tokens(chooser: &KvRouter) -> usize {
+            chooser
+                .get_potential_loads(&[], None, None, None, None)
+                .await
+                .unwrap()
+                .iter()
+                .map(|load| load.potential_prefill_tokens)
+                .sum()
+        }
+        async fn active_requests(chooser: &KvRouter) -> usize {
+            chooser
+                .get_potential_loads(&[], None, None, None, None)
+                .await
+                .unwrap()
+                .iter()
+                .map(|load| load.active_requests)
+                .sum()
+        }
+
+        let (prefill_router, prefill_chooser) = tracked_prefill_router().await;
+        let (_decode_binding, decode_chooser) = tracked_binding("decode-pool").await;
+        let prefill_selector = Arc::new(PrefillRouterStageSelector::new(
+            prefill_router.clone(),
+            PoolRef::new("prefill", 1),
+        ));
+        let decode_selector = Arc::new(KvRouterStageSelector::new(
+            decode_chooser.clone(),
+            PoolRef::new("decode", 1),
+        ));
+        let coordinator = RoutingCoordinator::new(
+            Topology::prefill_decode(),
+            [
+                StageBinding::new(
+                    StageId::PREFILL,
+                    PoolRef::new("prefill", 1),
+                    WorkerType::Prefill,
+                    prefill_selector,
+                ),
+                StageBinding::new(
+                    StageId::DECODE,
+                    PoolRef::new("decode", 1),
+                    WorkerType::Decode,
+                    decode_selector,
+                ),
+            ],
+            Arc::new(|_| Box::new(PrefillDecodePolicy::prefill_first())),
+        )
+        .unwrap();
+
+        let plan = coordinator
+            .plan_all(RoutingRequest::new(
+                "epp-request",
+                PromptInput::from_tokens(vec![1u32; 64]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(plan.stages.len(), 2);
+        assert!(
+            prefill_tokens(&prefill_chooser).await > 0,
+            "prefill admission accounts prompt work"
+        );
+        assert_eq!(active_requests(&decode_chooser).await, 1);
+
+        let mut prefill = None;
+        let mut decode = None;
+        for stage in plan.stages {
+            let (target, _, lease) = stage.reservation.into_parts();
+            if target.stage == StageId::PREFILL {
+                let reservation = lease.into_owner::<PrefillReservation>().ok().unwrap();
+                assert_eq!(reservation.worker_id(), target.worker.worker_id);
+                prefill = Some(reservation);
+            } else {
+                let reservation = lease.into_owner::<KvRouterReservation>().ok().unwrap();
+                assert_eq!(reservation.worker(), target.worker);
+                assert!(reservation.is_active());
+                decode = Some(reservation);
+            }
+        }
+        let prefill = prefill.expect("prefill stage planned");
+        let decode = decode.expect("decode stage planned");
+
+        // The first response body: prefill is over, decode keeps running.
+        prefill.release().await.unwrap();
+        decode.prefill_complete().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while prefill_tokens(&prefill_chooser).await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prefill reservation release frees prefill load");
+        assert_eq!(active_requests(&decode_chooser).await, 1);
+
+        // Request end: finishing twice is harmless.
+        decode.finish().await;
+        decode.finish().await;
+        assert!(!decode.is_active());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active_requests(&decode_chooser).await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("decode finish frees the booking");
+
+        // A preview on the decode pool is advisory.
+        let preview_coordinator = RoutingCoordinator::new(
+            Topology::aggregated(),
+            [StageBinding::new(
+                StageId::AGGREGATED,
+                PoolRef::new("decode", 1),
+                WorkerType::Aggregated,
+                Arc::new(KvRouterStageSelector::new(
+                    decode_chooser.clone(),
+                    PoolRef::new("decode", 1),
+                )),
+            )],
+            Arc::new(|_| {
+                Box::new(
+                    dynamo_kv_router::coordination::ConditionalDisaggregationPolicy::new(
+                        Box::new(
+                            dynamo_kv_router::conditional_disagg::IslBoundingPolicy::new(
+                                true,
+                                usize::MAX,
+                                2.0,
+                            ),
+                        ),
+                        Default::default(),
+                        Box::new(dynamo_kv_router::coordination::AggregatedPolicy::new()),
+                    ),
+                )
+            }),
+        );
+        // Conditional topology needs decode/prefill stages; just exercise the
+        // selector's preview directly instead.
+        drop(preview_coordinator);
+        let selector =
+            KvRouterStageSelector::new(decode_chooser.clone(), PoolRef::new("decode", 1));
+        let profile =
+            dynamo_kv_router::coordination::StageProfiles::for_worker_type(WorkerType::Decode);
+        let restrictions = dynamo_kv_router::coordination::SelectionRestrictions::default();
+        let settings = dynamo_kv_router::coordination::RequestSettings::default();
+        let stage = StageId::DECODE;
+        let tokens = vec![1u32; 64];
+        let preview = dynamo_kv_router::coordination::StageSelector::preview(
+            &selector,
+            dynamo_kv_router::coordination::SelectionInput {
+                request_id: "preview",
+                stage: &stage,
+                invocation: dynamo_kv_router::coordination::InvocationId::new(1),
+                attempt: dynamo_kv_router::coordination::AttemptId::FIRST,
+                prompt: dynamo_kv_router::coordination::PromptInputView {
+                    token_ids: &tokens,
+                    block_mm_infos: None,
+                    lora_name: None,
+                    cache_namespace: None,
+                },
+                profile: profile.default_profile(),
+                restrictions: &restrictions,
+                settings: &settings,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(preview.signals.prefill_load.is_some());
+        assert_eq!(active_requests(&decode_chooser).await, 0);
+
+        // Without an active prefill binding the prefill stage has no workers,
+        // which is what lets a host fall back to aggregated routing.
+        let inactive = PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None);
+        let inactive_selector =
+            PrefillRouterStageSelector::new(inactive, PoolRef::new("prefill", 1));
+        let prefill_profiles =
+            dynamo_kv_router::coordination::StageProfiles::for_worker_type(WorkerType::Prefill);
+        let prefill_stage = StageId::PREFILL;
+        let error = dynamo_kv_router::coordination::StageSelector::admit(
+            &inactive_selector,
+            dynamo_kv_router::coordination::SelectionInput {
+                request_id: "inactive",
+                stage: &prefill_stage,
+                invocation: dynamo_kv_router::coordination::InvocationId::new(1),
+                attempt: dynamo_kv_router::coordination::AttemptId::FIRST,
+                prompt: dynamo_kv_router::coordination::PromptInputView {
+                    token_ids: &tokens,
+                    block_mm_infos: None,
+                    lora_name: None,
+                    cache_namespace: None,
+                },
+                profile: prefill_profiles.default_profile(),
+                restrictions: &restrictions,
+                settings: &settings,
+            },
+            dynamo_kv_router::coordination::AdmissionTarget::AnyEligible,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, CoordinationError::NoEligibleWorkers { ref stage, .. } if *stage == StageId::PREFILL),
+            "{error}"
+        );
     }
 }
