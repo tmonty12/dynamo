@@ -67,7 +67,7 @@ pub use registry::{
 pub use selector::{
     AdmissionTarget, PrefillLoadSignal, Preview, PromptInputView, RequestSettings,
     ReservationLease, ReservationOwner, SelectedTarget, SelectionInput, SelectionRestrictions,
-    SelectionSignals, StageReservation, StageSelector, WorkerFacts,
+    SelectionSignals, StageReservation, StageSelector, WorkerFacts, reservation_id,
 };
 pub use session::{PromptInput, RouteSession, RoutingRequest, StageState};
 pub use stage::{

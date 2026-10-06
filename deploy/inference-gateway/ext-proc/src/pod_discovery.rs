@@ -81,18 +81,24 @@ impl PodDiscovery {
     /// (so nothing is routable), and recovers when both are healthy again — this
     /// is the gRPC health SERVING signal, so it must not latch true.
     pub async fn spawn(cfg: &EppStandaloneConfig) -> Result<(Self, Arc<AtomicBool>)> {
+        Self::spawn_for_pool(cfg, &cfg.inference_pool_name).await
+    }
+
+    /// Discover the `Ready` pods of one `InferencePool` in the configured
+    /// namespace. The decode pool is the one the `HTTPRoute` targets; a prefill
+    /// pool is a topology input only.
+    pub async fn spawn_for_pool(
+        cfg: &EppStandaloneConfig,
+        pool_name: &str,
+    ) -> Result<(Self, Arc<AtomicBool>)> {
         use futures::StreamExt;
         use kube::{Api, Client, runtime::WatchStreamExt, runtime::reflector, runtime::watcher};
 
         let client = Client::try_default().await?;
         let namespace = cfg.namespace.clone();
 
-        let (pool_rx, _pool_task) = spawn_pool_watch(
-            client.clone(),
-            namespace.clone(),
-            cfg.inference_pool_name.clone(),
-        )
-        .await?;
+        let (pool_rx, _pool_task) =
+            spawn_pool_watch(client.clone(), namespace.clone(), pool_name.to_string()).await?;
 
         // Namespace-wide pod watch; membership is decided in memory by the pool
         // selector so selector edits never require re-spawning this watch.
@@ -119,7 +125,7 @@ impl PodDiscovery {
 
         tracing::info!(
             namespace = %namespace,
-            pool = %cfg.inference_pool_name,
+            pool = %pool_name,
             kv_event_port = cfg.kv_event_port,
             "Starting namespace pod reflector for standalone mode"
         );

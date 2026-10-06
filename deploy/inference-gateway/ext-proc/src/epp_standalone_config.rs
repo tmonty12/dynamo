@@ -119,6 +119,12 @@ pub struct EppStandaloneConfig {
     /// `InferencePool` this EPP backs; its selector + target port drive discovery.
     #[validate(length(min = 1, message = "DYN_EPP_INFERENCE_POOL_NAME is required"))]
     pub inference_pool_name: String,
+    /// Optional `InferencePool` of prefill workers in the same namespace
+    /// (`DYN_EPP_PREFILL_INFERENCE_POOL_NAME`). When set, the EPP plans
+    /// prefill and decode together and names the prefill worker in
+    /// `x-prefiller-host-port` for the decode-side sidecar. The pool is a
+    /// topology input only; the gateway never routes to it directly.
+    pub prefill_inference_pool_name: Option<String>,
     /// Kubernetes namespace the EPP runs in (from `POD_NAMESPACE`, downward API).
     #[validate(length(min = 1, message = "POD_NAMESPACE is required"))]
     pub namespace: String,
@@ -223,6 +229,7 @@ impl EppStandaloneConfig {
                 .unwrap_or(DEFAULT_SELECTOR_THREADS),
             peer_replication,
             inference_pool_name: trimmed(get("DYN_EPP_INFERENCE_POOL_NAME")).unwrap_or_default(),
+            prefill_inference_pool_name: trimmed(get("DYN_EPP_PREFILL_INFERENCE_POOL_NAME")),
             namespace: trimmed(get("POD_NAMESPACE")).unwrap_or_default(),
             model_name: trimmed(get("DYN_MODEL_NAME")).unwrap_or_default(),
             tokenizer_service_url: trimmed(get("DYN_EPP_TOKENIZER_SERVICE_URL"))
@@ -254,7 +261,20 @@ impl EppStandaloneConfig {
     pub fn validate_config(&self) -> anyhow::Result<()> {
         self.validate()
             .map_err(|e| anyhow::anyhow!("invalid {STANDALONE_MODE} EPP config: {e}"))?;
+        if let Some(prefill_pool) = &self.prefill_inference_pool_name
+            && *prefill_pool == self.inference_pool_name
+        {
+            anyhow::bail!(
+                "invalid {STANDALONE_MODE} EPP config: DYN_EPP_PREFILL_INFERENCE_POOL_NAME must \
+                 name a different InferencePool than DYN_EPP_INFERENCE_POOL_NAME ({prefill_pool:?})"
+            );
+        }
         Ok(())
+    }
+
+    /// Whether this EPP plans prefill and decode across two pools.
+    pub fn disaggregated(&self) -> bool {
+        self.prefill_inference_pool_name.is_some()
     }
 }
 
@@ -431,6 +451,51 @@ mod tests {
         assert!(cfg.replay_port.is_none());
         assert!(cfg.total_kv_blocks.is_none());
         assert_eq!(cfg.max_inflight_requests, DEFAULT_MAX_INFLIGHT_REQUESTS);
+    }
+
+    #[test]
+    fn prefill_pool_is_optional_and_must_differ_from_the_decode_pool() {
+        let required = [
+            ("DYN_EPP_INFERENCE_POOL_NAME", "vllm-decode-pool"),
+            ("POD_NAMESPACE", "inference"),
+            ("DYN_MODEL_NAME", "Qwen/Qwen3-0.6B"),
+            ("DYN_EPP_TOKENIZER_SERVICE_URL", "http://vllm-render:8000"),
+            ("DYN_EPP_TOKENIZER_PROTOCOL", "vllm-render"),
+            ("DYN_KV_CACHE_BLOCK_SIZE", "16"),
+        ];
+        let aggregated = parse_cfg(&required).unwrap();
+        assert!(aggregated.prefill_inference_pool_name.is_none());
+        assert!(!aggregated.disaggregated());
+        aggregated.validate_config().unwrap();
+
+        let mut with_prefill = required.to_vec();
+        with_prefill.push(("DYN_EPP_PREFILL_INFERENCE_POOL_NAME", " vllm-prefill-pool "));
+        let disaggregated = parse_cfg(&with_prefill).unwrap();
+        assert_eq!(
+            disaggregated.prefill_inference_pool_name.as_deref(),
+            Some("vllm-prefill-pool")
+        );
+        assert!(disaggregated.disaggregated());
+        disaggregated.validate_config().unwrap();
+
+        let mut same_pool = required.to_vec();
+        same_pool.push(("DYN_EPP_PREFILL_INFERENCE_POOL_NAME", "vllm-decode-pool"));
+        // `parse_cfg` validates as `from_env` does.
+        let error = parse_cfg(&same_pool).unwrap_err();
+        assert!(
+            error.to_string().contains("different InferencePool"),
+            "{error}"
+        );
+
+        // Blank is the same as unset.
+        let mut blank = required.to_vec();
+        blank.push(("DYN_EPP_PREFILL_INFERENCE_POOL_NAME", "  "));
+        assert!(
+            parse_cfg(&blank)
+                .unwrap()
+                .prefill_inference_pool_name
+                .is_none()
+        );
     }
 
     #[test]
