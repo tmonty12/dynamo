@@ -32,11 +32,16 @@ use dynamo_kv_router::coordination::{
     RoutingRequest, SelectedTarget, SelectionInput, SelectionSignals, StageId, StageReservation,
     StageSelector, WorkerFacts,
 };
-use dynamo_kv_router::protocols::WorkerId;
+use dynamo_kv_router::protocols::{WorkerId, WorkerWithDpRank};
+use dynamo_kv_router::scheduling::{KvSchedulerError, queue::BookingHandle};
+use dynamo_runtime::error::{ErrorType, match_error_chain};
 use dynamo_runtime::pipeline::{Context, SingleIn};
 
+use crate::kv_router::prefill_router::PrefillError;
+use crate::kv_router::request_lease::RequestAttemptLease;
 use crate::kv_router::routing_host::{RoutePlan, RoutePlanSignals, RoutePreview, RoutingHost};
 use crate::kv_router::to_worker_selection_session_context;
+use crate::kv_router::{FindBestMatchOutcome, KvRouter, PrefillRouter};
 use crate::preprocessor::PreprocessedRequest;
 use crate::protocols::common::timing::RequestPhase;
 
@@ -416,6 +421,490 @@ pub(crate) fn host_error(error: &anyhow::Error) -> &anyhow::Error {
     match error.downcast_ref::<CoordinationError>() {
         Some(CoordinationError::Selector(inner)) => inner,
         _ => error,
+    }
+}
+
+/// Translate a routing-host selection failure into the coordinator's
+/// categories: scheduler rejections are retryable admissions, an empty or
+/// filtered pool is "no eligible workers", anything else is host-specific.
+fn map_router_error(stage: &StageId, error: anyhow::Error) -> CoordinationError {
+    if let Some(scheduler) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<KvSchedulerError>())
+    {
+        return match scheduler {
+            KvSchedulerError::NoEndpoints
+            | KvSchedulerError::AllEligibleWorkersFiltered
+            | KvSchedulerError::PinnedWorkerNotAllowed { .. } => {
+                CoordinationError::NoEligibleWorkers {
+                    stage: stage.clone(),
+                    reason: scheduler.to_string(),
+                }
+            }
+            KvSchedulerError::QueueRejected(_)
+            | KvSchedulerError::AllEligibleWorkersOverloaded
+            | KvSchedulerError::PinnedWorkerOverloaded { .. }
+            | KvSchedulerError::DeadlineExceeded => CoordinationError::AdmissionRejected {
+                stage: stage.clone(),
+                reason: scheduler.to_string(),
+            },
+            _ => CoordinationError::Selector(error),
+        };
+    }
+    if match_error_chain(
+        error.as_ref(),
+        &[
+            ErrorType::ResourceExhausted,
+            ErrorType::WorkerOverloaded,
+            ErrorType::DeadlineExceeded,
+        ],
+        &[],
+    ) {
+        return CoordinationError::AdmissionRejected {
+            stage: stage.clone(),
+            reason: error.to_string(),
+        };
+    }
+    if match_error_chain(error.as_ref(), &[ErrorType::Unavailable], &[]) {
+        return CoordinationError::NoEligibleWorkers {
+            stage: stage.clone(),
+            reason: error.to_string(),
+        };
+    }
+    CoordinationError::Selector(error)
+}
+
+fn worker_facts_from_router(router: &KvRouter, worker_id: WorkerId) -> Arc<WorkerFacts> {
+    Arc::new(
+        router
+            .workers_with_configs
+            .borrow()
+            .get(&worker_id)
+            .map(WorkerFacts::from_config)
+            .unwrap_or_default(),
+    )
+}
+
+fn validate_foreign_preview(
+    pool: &PoolRef,
+    input: &SelectionInput<'_>,
+    preview: &Preview,
+) -> Result<(), CoordinationError> {
+    if preview.target.stage != *input.stage {
+        return Err(CoordinationError::StalePreview {
+            stage: input.stage.clone(),
+            reason: format!("preview belongs to stage {}", preview.target.stage),
+        });
+    }
+    if preview.target.pool != *pool {
+        return Err(CoordinationError::StalePreview {
+            stage: input.stage.clone(),
+            reason: format!(
+                "preview selected from pool {} but the stage now draws from {pool}",
+                preview.target.pool
+            ),
+        });
+    }
+    if !input.restrictions.permits(preview.target.worker.worker_id) {
+        return Err(CoordinationError::StalePreview {
+            stage: input.stage.clone(),
+            reason: format!(
+                "previewed worker {} is no longer permitted",
+                preview.target.worker.worker_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// A coordinator stage selector over a [`KvRouter`] for hosts that do not
+/// dispatch through a `RoutingHost` (the EPP): previews are advisory
+/// selections, admissions book through the scheduler and return a
+/// [`KvRouterReservation`] the host drives by response observation.
+pub struct KvRouterStageSelector {
+    router: Arc<KvRouter>,
+    pool: PoolRef,
+}
+
+impl KvRouterStageSelector {
+    pub fn new(router: Arc<KvRouter>, pool: PoolRef) -> Self {
+        Self { router, pool }
+    }
+
+    pub fn router(&self) -> &Arc<KvRouter> {
+        &self.router
+    }
+
+    pub fn pool(&self) -> &PoolRef {
+        &self.pool
+    }
+
+    fn worker_ids(&self) -> HashSet<WorkerId> {
+        self.router
+            .workers_with_configs
+            .borrow()
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    fn target(&self, input: &SelectionInput<'_>, worker: WorkerWithDpRank) -> SelectedTarget {
+        SelectedTarget {
+            invocation: input.invocation,
+            attempt: input.attempt,
+            stage: input.stage.clone(),
+            pool: self.pool.clone(),
+            worker,
+            facts: worker_facts_from_router(&self.router, worker.worker_id),
+        }
+    }
+}
+
+#[async_trait]
+impl StageSelector for KvRouterStageSelector {
+    async fn preview(&self, input: SelectionInput<'_>) -> Result<Preview, CoordinationError> {
+        let settings = input.settings;
+        let restrictions = input.restrictions;
+        let admitted = self
+            .router
+            .preview_best_match_details_with_policy_class(
+                Some(input.request_id),
+                input.prompt.token_ids,
+                input.prompt.block_mm_infos,
+                input.router_config_override().as_ref(),
+                input.prompt.lora_name.map(str::to_string),
+                input.prompt.cache_namespace.map(str::to_string),
+                settings.priority_jump,
+                settings.strict_priority,
+                settings.policy_class.clone(),
+                settings.session_context.clone(),
+                input.expected_output_tokens(),
+                restrictions.pinned_worker,
+                restrictions.effective_allowed_worker_ids(|| self.worker_ids()),
+                restrictions.routing_constraints.clone(),
+            )
+            .await
+            .map_err(|error| map_router_error(input.stage, error))?;
+        let advisory_load = admitted.advisory_load;
+        match admitted.outcome {
+            FindBestMatchOutcome::Routed {
+                worker,
+                overlap_blocks,
+                cached_tokens,
+                potential_decode_blocks,
+                ..
+            } => {
+                let target = self.target(&input, worker);
+                let signals = SelectionSignals {
+                    overlap_blocks,
+                    cached_tokens,
+                    potential_decode_blocks,
+                    total_kv_blocks: advisory_load
+                        .and_then(|load| load.total_kv_blocks.map(|blocks| blocks as u64))
+                        .or(target.facts.total_kv_blocks),
+                    prefill_load: advisory_load.map(|load| PrefillLoadSignal {
+                        active_prefill_tokens: load.active_prefill_tokens,
+                        prefill_token_capacity: load.prefill_token_capacity,
+                    }),
+                };
+                Ok(Preview { target, signals })
+            }
+            FindBestMatchOutcome::QueueRejected { rejection } => {
+                Err(CoordinationError::AdmissionRejected {
+                    stage: input.stage.clone(),
+                    reason: rejection.to_string(),
+                })
+            }
+        }
+    }
+
+    async fn admit(
+        &self,
+        input: SelectionInput<'_>,
+        target: AdmissionTarget,
+    ) -> Result<StageReservation, CoordinationError> {
+        let pinned_worker = match &target {
+            AdmissionTarget::AnyEligible => input.restrictions.pinned_worker,
+            AdmissionTarget::FromPreview(preview) => {
+                validate_foreign_preview(&self.pool, &input, preview)?;
+                Some(preview.target.worker)
+            }
+        };
+        let settings = input.settings;
+        let restrictions = input.restrictions;
+        let reservation_id = input.reservation_id();
+        let admitted = self
+            .router
+            .find_best_match_details_with_policy_class_admitted(
+                Some(&reservation_id),
+                input.prompt.token_ids,
+                input.prompt.block_mm_infos,
+                input.router_config_override().as_ref(),
+                true,
+                false,
+                input.prompt.lora_name.map(str::to_string),
+                input.prompt.cache_namespace.map(str::to_string),
+                settings.priority_jump,
+                settings.strict_priority,
+                settings.policy_class.clone(),
+                settings.session_context.clone(),
+                input.expected_output_tokens(),
+                pinned_worker,
+                restrictions.effective_allowed_worker_ids(|| self.worker_ids()),
+                restrictions.routing_constraints.clone(),
+            )
+            .await
+            .map_err(|error| map_router_error(input.stage, error))?;
+        let (outcome, booking) = admitted.into_parts();
+        match outcome {
+            FindBestMatchOutcome::Routed {
+                worker,
+                overlap_blocks,
+                cached_tokens,
+                potential_decode_blocks,
+                ..
+            } => {
+                let target = self.target(&input, worker);
+                let signals = SelectionSignals {
+                    overlap_blocks,
+                    cached_tokens,
+                    potential_decode_blocks,
+                    total_kv_blocks: target.facts.total_kv_blocks,
+                    prefill_load: None,
+                };
+                let reservation =
+                    KvRouterReservation::new(Arc::clone(&self.router), worker, booking);
+                Ok(StageReservation::new(
+                    target,
+                    signals,
+                    ReservationLease::new(reservation),
+                ))
+            }
+            FindBestMatchOutcome::QueueRejected { rejection } => {
+                // Nothing was booked; a handle, if any, frees itself on drop.
+                drop(booking);
+                Err(CoordinationError::AdmissionRejected {
+                    stage: input.stage.clone(),
+                    reason: rejection.to_string(),
+                })
+            }
+        }
+    }
+}
+
+/// A booked KV-router selection a host drives from observed responses.
+///
+/// The booking lives in the router's request-lease manager, so a host that
+/// never finishes it is reaped on expiry like any other lease.
+pub struct KvRouterReservation {
+    router: Arc<KvRouter>,
+    worker: WorkerWithDpRank,
+    lease: Option<RequestAttemptLease>,
+}
+
+impl KvRouterReservation {
+    fn new(
+        router: Arc<KvRouter>,
+        worker: WorkerWithDpRank,
+        booking: Option<BookingHandle>,
+    ) -> Self {
+        // Nothing awaits between taking the booking over and registering it.
+        let lease = booking.map(|booking| {
+            router
+                .request_lease_manager()
+                .register_local(booking.commit(), None)
+        });
+        Self {
+            router,
+            worker,
+            lease,
+        }
+    }
+
+    pub fn worker(&self) -> WorkerWithDpRank {
+        self.worker
+    }
+
+    /// Whether the scheduler still tracks this booking.
+    pub fn is_active(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(RequestAttemptLease::is_active)
+    }
+
+    /// Record that the worker finished prefill for this request.
+    pub async fn prefill_complete(&self) -> Result<(), CoordinationError> {
+        let Some(lease) = self.lease.as_ref().filter(|lease| lease.is_active()) else {
+            return Ok(());
+        };
+        lease.touch();
+        self.router
+            .mark_prefill_completed_if_booking(lease.booking())
+            .await
+            .map_err(|error| CoordinationError::Selector(error.into()))
+    }
+
+    /// Record generated output blocks for this request.
+    pub async fn add_output_blocks(
+        &self,
+        num_blocks: usize,
+        decay_fraction: Option<f64>,
+    ) -> Result<(), CoordinationError> {
+        let Some(lease) = self.lease.as_ref().filter(|lease| lease.is_active()) else {
+            return Ok(());
+        };
+        lease.touch();
+        self.router
+            .add_output_blocks_if_booking(lease.booking(), num_blocks, decay_fraction)
+            .await
+            .map_err(|error| CoordinationError::Selector(error.into()))
+    }
+
+    /// Release the booking and wait for the scheduler. Idempotent.
+    pub async fn finish(&self) {
+        if let Some(lease) = &self.lease {
+            lease.finish().await;
+        }
+    }
+}
+
+impl ReservationOwner for KvRouterReservation {
+    fn release(self: Box<Self>) -> BoxFuture<'static, Result<(), CoordinationError>> {
+        Box::pin(async move {
+            self.finish().await;
+            Ok(())
+        })
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "kv router booking on worker {} dp_rank {}",
+            self.worker.worker_id, self.worker.dp_rank
+        )
+    }
+}
+
+/// A coordinator stage selector over a [`PrefillRouter`]'s reservation API,
+/// for hosts that route prefill by header (the EPP). Previews are not
+/// supported; admissions return the router's own [`PrefillReservation`].
+pub struct PrefillRouterStageSelector {
+    prefill_router: Arc<PrefillRouter>,
+    pool: PoolRef,
+}
+
+impl PrefillRouterStageSelector {
+    pub fn new(prefill_router: Arc<PrefillRouter>, pool: PoolRef) -> Self {
+        Self {
+            prefill_router,
+            pool,
+        }
+    }
+
+    pub fn pool(&self) -> &PoolRef {
+        &self.pool
+    }
+}
+
+fn map_prefill_error(stage: &StageId, error: anyhow::Error) -> CoordinationError {
+    if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<PrefillError>(),
+            Some(PrefillError::NotActivated)
+        )
+    }) {
+        return CoordinationError::NoEligibleWorkers {
+            stage: stage.clone(),
+            reason: "no prefill workers are active".to_string(),
+        };
+    }
+    let message = error.to_string();
+    if message.contains("queue rejection") {
+        return CoordinationError::AdmissionRejected {
+            stage: stage.clone(),
+            reason: message,
+        };
+    }
+    if message.contains("No workers available") {
+        return CoordinationError::NoEligibleWorkers {
+            stage: stage.clone(),
+            reason: message,
+        };
+    }
+    map_router_error(stage, error)
+}
+
+#[async_trait]
+impl StageSelector for PrefillRouterStageSelector {
+    async fn preview(&self, input: SelectionInput<'_>) -> Result<Preview, CoordinationError> {
+        Err(CoordinationError::PreviewUnsupported {
+            stage: input.stage.clone(),
+        })
+    }
+
+    async fn admit(
+        &self,
+        input: SelectionInput<'_>,
+        target: AdmissionTarget,
+    ) -> Result<StageReservation, CoordinationError> {
+        if let AdmissionTarget::FromPreview(_) = target {
+            return Err(CoordinationError::PreviewUnsupported {
+                stage: input.stage.clone(),
+            });
+        }
+        let settings = input.settings;
+        let restrictions = input.restrictions;
+        let reservation_id = input.reservation_id();
+        let reservation = self
+            .prefill_router
+            .reserve_prefill_worker(
+                &reservation_id,
+                input.prompt.token_ids,
+                input.prompt.block_mm_infos,
+                input.prompt.lora_name.map(str::to_string),
+                input.prompt.cache_namespace.map(str::to_string),
+                settings.priority_jump,
+                settings.strict_priority,
+                settings.policy_class.clone(),
+                restrictions.allowed_worker_ids.clone(),
+                restrictions.routing_constraints.clone(),
+            )
+            .await
+            .map_err(|error| map_prefill_error(input.stage, error))?;
+        let worker =
+            WorkerWithDpRank::new(reservation.worker_id(), reservation.dp_rank().unwrap_or(0));
+        if !restrictions.permits(worker.worker_id) {
+            // Exclusions are not part of the reservation API; enforce them here.
+            reservation
+                .release()
+                .await
+                .map_err(|error| CoordinationError::Release(error.to_string()))?;
+            return Err(CoordinationError::NoEligibleWorkers {
+                stage: input.stage.clone(),
+                reason: format!("prefill selected excluded worker {}", worker.worker_id),
+            });
+        }
+        let facts = Arc::new(
+            self.prefill_router
+                .prefill_worker_facts(worker.worker_id)
+                .unwrap_or_default(),
+        );
+        let target = SelectedTarget {
+            invocation: input.invocation,
+            attempt: input.attempt,
+            stage: input.stage.clone(),
+            pool: self.pool.clone(),
+            worker,
+            facts,
+        };
+        Ok(StageReservation::new(
+            target,
+            SelectionSignals::default(),
+            ReservationLease::new(reservation),
+        ))
     }
 }
 

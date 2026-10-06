@@ -15,11 +15,20 @@ use std::time::Duration;
 
 use anyhow::Result;
 use dashmap::DashMap;
-use dynamo_kv_router::config::{RouterConfigOverride, try_kv_router_config_from_dynamo_env};
-use dynamo_kv_router::protocols::{RoutingConstraints, WorkerWithDpRank};
+use dynamo_kv_router::WorkerType;
+use dynamo_kv_router::config::try_kv_router_config_from_dynamo_env;
+use dynamo_kv_router::coordination::{
+    AggregatedPolicy, CoordinationError, DelegatedPlan, PoolRef, PrefillDecodePolicy, PromptInput,
+    RequestSettings, RoutingCoordinator, RoutingRequest, SelectionRestrictions, StageBinding,
+    StageId, StageSelector, Topology,
+};
+use dynamo_kv_router::protocols::RoutingConstraints;
 use dynamo_llm::discovery::{ModelManager, WORKER_TYPE_DECODE};
+use dynamo_llm::kv_router::coordination::{
+    KvRouterReservation, KvRouterStageSelector, PrefillRouterStageSelector,
+};
 use dynamo_llm::kv_router::prefill_router::PrefillReservation;
-use dynamo_llm::kv_router::{FindBestMatchOutcome, ManagedKvRouter, PrefillRouter};
+use dynamo_llm::kv_router::{ManagedKvRouter, PrefillRouter};
 use dynamo_llm::model_card::ModelDeploymentCard;
 use dynamo_llm::preprocessor::OpenAIPreprocessor;
 use dynamo_llm::protocols::common::extensions::{NvExt, NvExtProvider, routing_constraints_to_kv};
@@ -81,15 +90,6 @@ fn validate_kube_discovery_mode_value(mode: Option<&str>) -> Result<bool> {
     }
 }
 
-fn decode_router_config_override(is_disaggregated: bool) -> Option<RouterConfigOverride> {
-    is_disaggregated.then_some(RouterConfigOverride {
-        overlap_score_credit: Some(0.0),
-        assume_kv_reuse: Some(false),
-        track_prefill_tokens: Some(false),
-        ..Default::default()
-    })
-}
-
 /// Resolve a typed request's body inputs together with the HTTP headers.
 fn cache_namespace_from_request<R: NvExtProvider>(
     request: &R,
@@ -111,8 +111,14 @@ const DYNAMO_CONTAINER_PORT_NAME: &str = "http";
 /// This is the async-native equivalent of `RouterHandles` from the C bindings,
 /// without the `block_on` / unsafe FFI overhead.
 pub struct Router {
-    prefill_router: Arc<PrefillRouter>,
-    prefill_bookings: DashMap<String, PrefillReservation>,
+    /// Reservations for in-flight requests, keyed by the pick's reservation id.
+    plans: DashMap<String, ActivePlan>,
+    /// Selects and books prefill then decode before the request leaves the EPP.
+    disaggregated: RoutingCoordinator,
+    /// Selects and books one aggregated worker.
+    aggregated: RoutingCoordinator,
+    /// Owns the decode load context; dropping it would stop load monitoring.
+    #[allow(dead_code)]
     decode_router: ManagedKvRouter,
     preprocessor: Arc<OpenAIPreprocessor>,
     runtime: Runtime,
@@ -121,14 +127,154 @@ pub struct Router {
     served_model: String,
 }
 
-/// Remove and release a booking once. Both response lifecycle callbacks use
-/// this helper so terminal completion before first output and duplicate signals
-/// have identical behavior.
-async fn release_prefill_booking(
-    prefill_bookings: &DashMap<String, PrefillReservation>,
+/// The reservations a picked request holds until its response ends.
+struct ActivePlan {
+    /// Released on the first response body or at request end, whichever first.
+    prefill: Option<PrefillReservation>,
+    /// Marked prefill-complete on the first response body; finished at request end.
+    decode: Arc<KvRouterReservation>,
+}
+
+/// Whether a disaggregated plan failed only because prefill could not be
+/// selected, so the request can still be served aggregated.
+fn falls_back_to_aggregated(error: &CoordinationError) -> bool {
+    match error {
+        CoordinationError::NoEligibleWorkers { stage, .. }
+        | CoordinationError::AdmissionRejected { stage, .. }
+        | CoordinationError::PreviewUnsupported { stage } => *stage == StageId::PREFILL,
+        _ => false,
+    }
+}
+
+/// The routing headers the worker reads: the decode target and, when prefill
+/// was planned, the prefill target and mode.
+fn routing_headers(
+    decode_worker_id: u64,
+    decode_dp_rank: u32,
+    prefill: Option<PrefillTarget>,
+) -> Vec<(String, String)> {
+    let mut headers = vec![
+        (
+            "x-dynamo-worker-instance-id".to_string(),
+            format!("{decode_worker_id}"),
+        ),
+        ("x-dynamo-dp-rank".to_string(), decode_dp_rank.to_string()),
+    ];
+    match prefill {
+        Some((prefill_worker_id, prefill_dp_rank)) => {
+            headers.push((
+                "x-dynamo-routing-mode".to_string(),
+                "disaggregated".to_string(),
+            ));
+            headers.push((
+                "x-dynamo-prefill-instance-id".to_string(),
+                format!("{prefill_worker_id}"),
+            ));
+            if let Some(prefill_dp_rank) = prefill_dp_rank {
+                headers.push((
+                    "x-dynamo-prefill-dp-rank".to_string(),
+                    prefill_dp_rank.to_string(),
+                ));
+            }
+        }
+        None => headers.push((
+            "x-dynamo-routing-mode".to_string(),
+            "aggregated".to_string(),
+        )),
+    }
+    headers
+}
+
+/// Build the two coordinators the runtime EPP plans with: prefill then
+/// decode, both booked before the request leaves, and aggregated.
+fn build_coordinators(
+    prefill_router: Arc<PrefillRouter>,
+    decode_router: &ManagedKvRouter,
+) -> Result<(RoutingCoordinator, RoutingCoordinator)> {
+    let decode_selector = Arc::new(KvRouterStageSelector::new(
+        Arc::clone(decode_router.router()),
+        PoolRef::new("decode", 1),
+    ));
+    let prefill_selector = Arc::new(PrefillRouterStageSelector::new(
+        prefill_router,
+        PoolRef::new("prefill", 1),
+    ));
+    let disaggregated = RoutingCoordinator::new(
+        Topology::prefill_decode(),
+        [
+            StageBinding::new(
+                StageId::PREFILL,
+                prefill_selector.pool().clone(),
+                WorkerType::Prefill,
+                prefill_selector,
+            ),
+            StageBinding::new(
+                StageId::DECODE,
+                decode_selector.pool().clone(),
+                WorkerType::Decode,
+                Arc::clone(&decode_selector) as Arc<dyn StageSelector>,
+            ),
+        ],
+        Arc::new(|_| Box::new(PrefillDecodePolicy::prefill_first())),
+    )?;
+    let aggregated = RoutingCoordinator::new(
+        Topology::aggregated(),
+        [StageBinding::new(
+            StageId::AGGREGATED,
+            decode_selector.pool().clone(),
+            WorkerType::Aggregated,
+            decode_selector,
+        )],
+        Arc::new(|_| Box::new(AggregatedPolicy::new())),
+    )?;
+    Ok((disaggregated, aggregated))
+}
+
+/// The prefill worker and data-parallel rank a plan selected, for the
+/// routing headers.
+type PrefillTarget = (u64, Option<u32>);
+
+/// Split a complete plan into the reservations this picker drives, plus the
+/// prefill target for the routing headers.
+fn into_active_plan(plan: DelegatedPlan) -> Result<(ActivePlan, Option<PrefillTarget>)> {
+    let mut prefill = None;
+    let mut prefill_target = None;
+    let mut decode = None;
+    for stage in plan.stages {
+        let stage_id = stage.stage.clone();
+        let (_, _, lease) = stage.reservation.into_parts();
+        if stage_id == StageId::PREFILL {
+            let reservation = lease.into_owner::<PrefillReservation>().map_err(|_| {
+                anyhow::anyhow!("prefill stage was not reserved through the prefill router")
+            })?;
+            prefill_target = Some((reservation.worker_id(), reservation.dp_rank()));
+            prefill = Some(*reservation);
+        } else {
+            let reservation = lease.into_owner::<KvRouterReservation>().map_err(|_| {
+                anyhow::anyhow!("stage {stage_id} was not reserved through the decode router")
+            })?;
+            decode = Some(Arc::new(*reservation));
+        }
+    }
+    let decode = decode.ok_or_else(|| anyhow::anyhow!("plan has no decode or aggregated stage"))?;
+    Ok((ActivePlan { prefill, decode }, prefill_target))
+}
+
+/// Take the prefill reservation out of a plan once, without holding the map
+/// lock across its release. Both response lifecycle callbacks use this so
+/// terminal completion before first output and duplicate signals behave the
+/// same.
+fn take_prefill_reservation(
+    plans: &DashMap<String, ActivePlan>,
     booking_id: &str,
-) {
-    if let Some((_, reservation)) = prefill_bookings.remove(booking_id)
+) -> Option<PrefillReservation> {
+    plans
+        .get_mut(booking_id)
+        .and_then(|mut plan| plan.prefill.take())
+}
+
+async fn release_prefill_reservation(reservation: Option<PrefillReservation>, booking_id: &str) {
+    if let Some(reservation) = reservation
         && let Err(error) = reservation.release().await
     {
         tracing::debug!(
@@ -238,9 +384,12 @@ impl Router {
         // and pod reflector all clone whatever they need from these
         // constructor-locals before this scope ends, so dropping them here
         // does not tear down any background work.
+        let (disaggregated, aggregated) = build_coordinators(prefill_router, &decode_router)?;
+
         Ok(Self {
-            prefill_router,
-            prefill_bookings: DashMap::new(),
+            plans: DashMap::new(),
+            disaggregated,
+            aggregated,
             decode_router,
             preprocessor: bootstrap.preprocessor,
             runtime,
@@ -461,178 +610,6 @@ impl Router {
             .filter(|(_, addr_port)| endpoint_in_subset(addr_port, &candidates, &candidate_ips))
             .map(|(id, _)| *id)
             .collect()
-    }
-
-    /// Atomically select and reserve a prefill worker.
-    ///
-    /// Queue priorities are forwarded to the prefill scheduler. `priority_jump`
-    /// adjusts the policy score, while `strict_priority` selects the primary
-    /// tier. `policy_class` names the scheduling policy class the reservation
-    /// queues under. `routing_constraints` carries the request's
-    /// required/preferred taints (lifted from `nvext.routing_constraints`); a
-    /// hard `required_taints` mismatch excludes a worker from selection.
-    #[expect(clippy::too_many_arguments)]
-    pub async fn route_prefill(
-        &self,
-        reservation_id: &str,
-        tokens: &[u32],
-        cache_namespace: Option<String>,
-        priority_jump: f64,
-        strict_priority: u32,
-        policy_class: Option<String>,
-        allowed_worker_ids: Option<HashSet<u64>>,
-        routing_constraints: RoutingConstraints,
-    ) -> Result<PrefillReservation> {
-        self.prefill_router
-            .reserve_prefill_worker(
-                reservation_id,
-                tokens,
-                None,
-                None,
-                cache_namespace,
-                priority_jump,
-                strict_priority,
-                policy_class,
-                allowed_worker_ids,
-                routing_constraints,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Prefill reservation failed: {e}"))
-    }
-
-    /// Route a decode request. Returns (WorkerWithDpRank, overlap_blocks).
-    ///
-    /// Queue priorities are forwarded to the decode scheduler. `priority_jump`
-    /// adjusts the policy score, while `strict_priority` selects the primary
-    /// tier. `policy_class` names the scheduling policy class the request queues
-    /// under. `routing_constraints` carries the request's required/preferred
-    /// taints (lifted from `nvext.routing_constraints`); a hard `required_taints`
-    /// mismatch excludes a worker from selection.
-    ///
-    /// A per-class queue limit rejection surfaces as an error here, the same as
-    /// it does for the integrated frontend.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn route_decode(
-        &self,
-        tokens: &[u32],
-        is_disaggregated: bool,
-        cache_namespace: Option<String>,
-        priority_jump: f64,
-        strict_priority: u32,
-        policy_class: Option<String>,
-        allowed_worker_ids: Option<HashSet<u64>>,
-        routing_constraints: RoutingConstraints,
-    ) -> Result<(WorkerWithDpRank, u32)> {
-        let config_override = decode_router_config_override(is_disaggregated);
-
-        let outcome = self
-            .decode_router
-            .find_best_match_details_with_policy_class(
-                None,
-                tokens,
-                None,
-                config_override.as_ref(),
-                false,
-                false,
-                None,
-                cache_namespace,
-                priority_jump,
-                strict_priority,
-                policy_class,
-                None,
-                None,
-                None,
-                allowed_worker_ids,
-                routing_constraints,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Decode query failed: {:?}", e))?;
-
-        match outcome {
-            FindBestMatchOutcome::Routed {
-                worker,
-                overlap_blocks,
-                ..
-            } => Ok((worker, overlap_blocks)),
-            FindBestMatchOutcome::QueueRejected { rejection } => {
-                Err(anyhow::anyhow!("Decode query failed: {rejection}"))
-            }
-        }
-    }
-
-    /// Register a request with the decode router for bookkeeping.
-    pub async fn add_request(
-        &self,
-        request_id: &str,
-        tokens: &[u32],
-        worker_id: u64,
-        dp_rank: u32,
-        is_disaggregated: bool,
-        cache_namespace: Option<String>,
-    ) -> Result<()> {
-        let decode_router = self.decode_router.clone();
-        let request_id = request_id.to_owned();
-        let tokens = tokens.to_vec();
-
-        tokio::time::timeout(BOOKKEEPING_TIMEOUT, async {
-            let worker = WorkerWithDpRank::new(worker_id, dp_rank);
-            let router_config_override = decode_router_config_override(is_disaggregated);
-
-            let overlap_blocks = decode_router
-                .get_overlap_blocks(&tokens, None, worker, None, cache_namespace.as_deref())
-                .await
-                .map_err(|e| anyhow::anyhow!("get_overlap_blocks failed: {e:?}"))?;
-
-            let cached_tokens = overlap_blocks as usize * decode_router.block_size() as usize;
-
-            decode_router
-                .add_request(
-                    request_id,
-                    &tokens,
-                    None,
-                    cached_tokens,
-                    None,
-                    worker,
-                    None,
-                    cache_namespace,
-                    router_config_override.as_ref(),
-                )
-                .await;
-
-            Ok(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("add_request timed out"))?
-    }
-
-    /// Mark prefill as completed for a request.
-    pub async fn mark_prefill_complete(&self, request_id: &str) -> Result<()> {
-        let decode_router = self.decode_router.clone();
-        let request_id = request_id.to_owned();
-
-        tokio::time::timeout(BOOKKEEPING_TIMEOUT, async {
-            decode_router
-                .mark_prefill_completed(&request_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("mark_prefill_completed failed: {e}"))
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("mark_prefill_complete timed out"))?
-    }
-
-    /// Free a request from the router's bookkeeping.
-    pub async fn free_request(&self, request_id: &str) -> Result<()> {
-        let decode_router = self.decode_router.clone();
-        let request_id = request_id.to_owned();
-
-        tokio::time::timeout(BOOKKEEPING_TIMEOUT, async {
-            decode_router
-                .free(&request_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("free failed: {e}"))
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("free_request timed out"))?
     }
 
     pub fn runtime(&self) -> &Runtime {
@@ -1449,59 +1426,76 @@ impl EndpointPicker for Router {
         let policy_class = requested_policy_class(&req.headers)?;
         let reservation_id = Uuid::new_v4().to_string();
 
-        // Try prefill routing first (disaggregated mode).
-        //
-        // If the prefill router is not activated (no prefill workers discovered yet, or the inner
-        // router has been deactivated), fall back to aggregated routing.
-        let prefill_booking = self
-            .route_prefill(
-                &format!("epp-prefill/{reservation_id}"),
-                &tokens,
-                cache_namespace.clone(),
-                priority_jump,
-                strict_priority,
-                policy_class.clone(),
-                allowed_worker_ids.clone(),
-                routing_constraints.clone(),
-            )
-            .await;
-
-        let is_disaggregated = match &prefill_booking {
-            Ok(_) => true,
-            Err(e) => {
+        // Plan prefill and decode together, booking both before the request
+        // leaves the EPP. Only decode admission respects the Envoy subset hint:
+        // it names destination endpoints, which never describe the prefill pool.
+        let shared_tokens = Arc::new(tokens.clone());
+        let routing_request = || {
+            let prompt = PromptInput {
+                token_ids: Arc::clone(&shared_tokens),
+                block_mm_infos: None,
+                lora_name: None,
+                cache_namespace: cache_namespace.clone(),
+            };
+            let shared = SelectionRestrictions {
+                routing_constraints: routing_constraints.clone(),
+                ..SelectionRestrictions::default()
+            };
+            let decode_restrictions = SelectionRestrictions {
+                allowed_worker_ids: allowed_worker_ids.clone(),
+                ..shared.clone()
+            };
+            RoutingRequest::new(&reservation_id, prompt)
+                .with_settings(RequestSettings {
+                    priority_jump,
+                    strict_priority,
+                    policy_class: policy_class.clone(),
+                    ..RequestSettings::default()
+                })
+                .with_stage_restrictions(StageId::PREFILL, shared)
+                .with_stage_restrictions(StageId::DECODE, decode_restrictions.clone())
+                .with_stage_restrictions(StageId::AGGREGATED, decode_restrictions)
+        };
+        let plan = match self.disaggregated.plan_all(routing_request()).await {
+            Ok(plan) => plan,
+            Err(error) if falls_back_to_aggregated(&error) => {
+                // No active prefill worker, or none that would admit the
+                // request: serve it aggregated, as before.
                 tracing::debug!(
-                    error = %e,
+                    error = %error,
                     "Prefill routing failed; falling back to aggregated mode"
                 );
-                false
+                self.aggregated
+                    .plan_all(routing_request())
+                    .await
+                    .map_err(|e| PickError::RoutingFailed(format!("Decode query failed: {e}")))?
+            }
+            Err(error) => {
+                return Err(PickError::RoutingFailed(format!(
+                    "Decode query failed: {error}"
+                )));
             }
         };
-
-        let (decode_worker, _overlap) = self
-            .route_decode(
-                &tokens,
-                is_disaggregated,
-                cache_namespace.clone(),
-                priority_jump,
-                strict_priority,
-                policy_class,
-                allowed_worker_ids,
-                routing_constraints,
-            )
-            .await
-            .map_err(|e| PickError::RoutingFailed(e.to_string()))?;
+        let (active, prefill_worker) =
+            into_active_plan(plan).map_err(|e| PickError::RoutingFailed(e.to_string()))?;
+        let decode_worker = active.decode.worker();
+        let is_disaggregated = prefill_worker.is_some();
 
         // TODO(epp-endpoint-reconciliation): Reconcile Dynamo discovery with the
         // pod reflector and retry selection when the chosen worker has no endpoint.
         let endpoint = if worker_map.is_empty() {
-            self.resolve_worker_endpoint(decode_worker.worker_id)
-                .ok_or_else(|| {
+            match self.resolve_worker_endpoint(decode_worker.worker_id) {
+                Some(endpoint) => endpoint,
+                None => {
                     tracing::warn!(
                         worker_id = decode_worker.worker_id,
                         "Selected worker has no resolved endpoint"
                     );
-                    PickError::NoEndpoints
-                })?
+                    release_prefill_reservation(active.prefill, &reservation_id).await;
+                    active.decode.finish().await;
+                    return Err(PickError::NoEndpoints);
+                }
+            }
         } else {
             worker_map
                 .iter()
@@ -1516,68 +1510,13 @@ impl EndpointPicker for Router {
                 })
         };
 
-        // Register the request with the router for bookkeeping (load tracking).
-        if let Err(e) = self
-            .add_request(
-                &reservation_id,
-                &tokens,
-                decode_worker.worker_id,
-                decode_worker.dp_rank,
-                is_disaggregated,
-                cache_namespace.clone(),
-            )
-            .await
-        {
-            tracing::warn!(
-                request_id = %req.request_id,
-                error = %e,
-                "Failed to register request with router bookkeeping"
-            );
-        }
+        self.plans.insert(reservation_id.clone(), active);
 
-        let prefill_worker = prefill_booking
-            .as_ref()
-            .ok()
-            .map(|booking| (booking.worker_id(), booking.dp_rank()));
-        if let Ok(booking) = prefill_booking {
-            self.prefill_bookings
-                .insert(reservation_id.clone(), booking);
-        }
-
-        // Build routing headers: x-dynamo-worker-instance-id, x-dynamo-dp-rank,
-        // x-dynamo-prefill-instance-id, x-dynamo-prefill-dp-rank, x-dynamo-routing-mode
-        let mut headers = vec![
-            (
-                "x-dynamo-worker-instance-id".to_string(),
-                format!("{}", decode_worker.worker_id),
-            ),
-            (
-                "x-dynamo-dp-rank".to_string(),
-                decode_worker.dp_rank.to_string(),
-            ),
-        ];
-
-        if let Some((prefill_worker_id, prefill_dp_rank)) = prefill_worker {
-            headers.push((
-                "x-dynamo-routing-mode".to_string(),
-                "disaggregated".to_string(),
-            ));
-            headers.push((
-                "x-dynamo-prefill-instance-id".to_string(),
-                format!("{}", prefill_worker_id),
-            ));
-            if let Some(prefill_dp_rank) = prefill_dp_rank {
-                headers.push((
-                    "x-dynamo-prefill-dp-rank".to_string(),
-                    prefill_dp_rank.to_string(),
-                ));
-            }
-        } else {
-            headers.push((
-                "x-dynamo-routing-mode".to_string(),
-                "aggregated".to_string(),
-            ));
-        }
+        let headers = routing_headers(
+            decode_worker.worker_id,
+            decode_worker.dp_rank,
+            prefill_worker,
+        );
 
         tracing::info!(
             worker_id = decode_worker.worker_id,
@@ -1621,11 +1560,21 @@ impl EndpointPicker for Router {
         if booking_id.is_empty() {
             return;
         }
-        release_prefill_booking(&self.prefill_bookings, booking_id).await;
-        if let Err(e) = self.mark_prefill_complete(booking_id).await {
+        let prefill = take_prefill_reservation(&self.plans, booking_id);
+        release_prefill_reservation(prefill, booking_id).await;
+        let decode = self
+            .plans
+            .get(booking_id)
+            .map(|plan| Arc::clone(&plan.decode));
+        if let Some(decode) = decode
+            && let Err(error) = tokio::time::timeout(BOOKKEEPING_TIMEOUT, decode.prefill_complete())
+                .await
+                .map_err(|_| anyhow::anyhow!("prefill_complete timed out"))
+                .and_then(|result| result.map_err(anyhow::Error::from))
+        {
             tracing::debug!(
                 reservation_id = booking_id,
-                error = %e,
+                %error,
                 "Failed to mark prefill complete in router bookkeeping"
             );
         }
@@ -1645,12 +1594,17 @@ impl EndpointPicker for Router {
                 "Request complete with usage"
             );
         }
-        release_prefill_booking(&self.prefill_bookings, booking_id).await;
-        if let Err(e) = self.free_request(booking_id).await {
+        let Some((_, plan)) = self.plans.remove(booking_id) else {
+            return;
+        };
+        release_prefill_reservation(plan.prefill, booking_id).await;
+        if tokio::time::timeout(BOOKKEEPING_TIMEOUT, plan.decode.finish())
+            .await
+            .is_err()
+        {
             tracing::debug!(
                 reservation_id = booking_id,
-                error = %e,
-                "Failed to free request from router bookkeeping"
+                "Timed out freeing request from router bookkeeping"
             );
         }
     }
@@ -1662,6 +1616,67 @@ mod tests {
     use k8s_openapi::api::core::v1::Pod;
 
     use std::sync::{Arc, atomic::Ordering};
+
+    #[test]
+    fn routing_headers_name_both_targets_for_a_disaggregated_plan() {
+        let headers = routing_headers(7, 1, Some((11, Some(2))));
+        let get = |key: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("x-dynamo-worker-instance-id"), Some("7"));
+        assert_eq!(get("x-dynamo-dp-rank"), Some("1"));
+        assert_eq!(get("x-dynamo-routing-mode"), Some("disaggregated"));
+        assert_eq!(get("x-dynamo-prefill-instance-id"), Some("11"));
+        assert_eq!(get("x-dynamo-prefill-dp-rank"), Some("2"));
+
+        let headers = routing_headers(7, 0, Some((11, None)));
+        assert!(headers.iter().all(|(k, _)| k != "x-dynamo-prefill-dp-rank"));
+
+        let headers = routing_headers(7, 0, None);
+        let get = |key: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("x-dynamo-routing-mode"), Some("aggregated"));
+        assert_eq!(get("x-dynamo-prefill-instance-id"), None);
+    }
+
+    #[test]
+    fn only_prefill_selection_failures_fall_back_to_aggregated() {
+        assert!(falls_back_to_aggregated(
+            &CoordinationError::NoEligibleWorkers {
+                stage: StageId::PREFILL,
+                reason: "inactive".to_string(),
+            }
+        ));
+        assert!(falls_back_to_aggregated(
+            &CoordinationError::AdmissionRejected {
+                stage: StageId::PREFILL,
+                reason: "queue".to_string(),
+            }
+        ));
+        assert!(!falls_back_to_aggregated(
+            &CoordinationError::NoEligibleWorkers {
+                stage: StageId::DECODE,
+                reason: "none".to_string(),
+            }
+        ));
+        assert!(!falls_back_to_aggregated(
+            &CoordinationError::AdmissionRejected {
+                stage: StageId::DECODE,
+                reason: "queue".to_string(),
+            }
+        ));
+        assert!(!falls_back_to_aggregated(&CoordinationError::Finished));
+        assert!(!falls_back_to_aggregated(&CoordinationError::Selector(
+            anyhow::anyhow!("boom")
+        )));
+    }
 
     /// Proves the core feature: `nvext.agent_hints.priority` lifts into a
     /// non-zero `priority_jump`, and absence collapses to `0.0`. If this

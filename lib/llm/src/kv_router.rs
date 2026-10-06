@@ -57,7 +57,7 @@ use futures::stream;
 pub use dynamo_kv_router::protocols;
 pub use dynamo_kv_router::scheduling;
 
-pub(crate) mod coordination;
+pub mod coordination;
 pub(crate) mod embedded;
 pub mod encoder_router;
 pub mod indexer;
@@ -1254,6 +1254,49 @@ impl KvRouter {
             self.enroll_public_request_attempt(booking, None).await?;
         }
         Ok(admitted.outcome)
+    }
+
+    /// Advisory selection for the stage coordinator: the scheduler's choice
+    /// and that worker's load, without queue admission or a booking.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn preview_best_match_details_with_policy_class(
+        &self,
+        context_id: Option<&str>,
+        tokens: &[u32],
+        block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+        router_config_override: Option<&RouterConfigOverride>,
+        lora_name: Option<String>,
+        cache_namespace: Option<String>,
+        priority_jump: f64,
+        strict_priority: u32,
+        policy_class: Option<String>,
+        session_context: Option<dynamo_kv_router::SessionContext>,
+        expected_output_tokens: Option<u32>,
+        pinned_worker: Option<WorkerWithDpRank>,
+        allowed_worker_ids: Option<HashSet<WorkerId>>,
+        routing_constraints: RoutingConstraints,
+    ) -> anyhow::Result<AdmittedFindBestMatchOutcome> {
+        self.find_best_match_details_with_policy_class_inner(
+            context_id,
+            tokens,
+            block_mm_infos,
+            router_config_override,
+            false,
+            false,
+            lora_name,
+            cache_namespace,
+            priority_jump,
+            strict_priority,
+            policy_class,
+            session_context,
+            expected_output_tokens,
+            None,
+            pinned_worker,
+            allowed_worker_ids,
+            routing_constraints,
+            FindBestMatchAdmission::WithoutAdmission,
+        )
+        .await
     }
 
     /// Return the admitted routing wrapper without enrolling its booking handle
