@@ -49,6 +49,15 @@ impl Registry {
     }
 
     /// Check if a shared object exists in the registry by key.
+    /// A registry holding this registry's shared objects. Takable objects
+    /// stay with the original.
+    pub fn fork_shared(&self) -> Self {
+        Self {
+            shared_storage: self.shared_storage.clone(),
+            unique_storage: HashMap::new(),
+        }
+    }
+
     pub fn contains_shared(&self, key: &str) -> bool {
         self.shared_storage.contains_key(key)
     }

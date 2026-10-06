@@ -361,6 +361,7 @@ mod tests {
                 },
                 router: shared.clone(),
                 prefill_router_mode: mode,
+                generation: 1,
             },
         )));
         prefill.lifecycle.store(
@@ -429,6 +430,7 @@ mod tests {
             endpoint_id,
             router: Arc::new(RoutingHost::new(push_router, chooser.clone(), None).unwrap()),
             prefill_router_mode: RouterMode::KV,
+            generation: 1,
         });
         (binding, chooser)
     }

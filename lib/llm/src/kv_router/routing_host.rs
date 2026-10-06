@@ -334,6 +334,8 @@ pub(crate) struct RoutePlanSignals {
     pub(crate) cached_tokens: usize,
     pub(crate) potential_decode_blocks: u64,
     pub(crate) total_kv_blocks: Option<u64>,
+    /// The selected worker's prefill queue, reported by advisory selections only.
+    pub(crate) prefill_load: Option<dynamo_kv_router::scheduling::AdvisoryWorkerLoad>,
 }
 
 impl RoutePreview {
@@ -358,7 +360,7 @@ impl RoutePlan {
         self.budget.remaining()
     }
 
-    #[cfg(test)]
+    /// Release the admitted reservation without dispatching.
     pub(crate) async fn abort(self) {
         self.cleanup.finish().await;
     }

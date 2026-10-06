@@ -193,6 +193,7 @@ impl RoutingHost {
             cached_tokens: selection.cached_tokens,
             potential_decode_blocks: selection.potential_decode_blocks,
             total_kv_blocks,
+            prefill_load: selection.selected_worker_load,
         }
     }
 
@@ -241,12 +242,6 @@ impl RoutingHost {
         request: &SingleIn<PreprocessedRequest>,
         preview: RoutePreview,
     ) -> Result<RoutePlan, Error> {
-        // Inherited, not restarted: this stage continues the route the preview
-        // opened.
-        let budget = preview.budget;
-        if self.kv_router_if_enabled().is_none() {
-            return Err(anyhow::anyhow!("KV route plans require KV routing"));
-        }
         if request.context().id() != preview.request_id {
             return Err(anyhow::anyhow!(
                 "KV route preview belongs to request {}, not {}",
@@ -254,11 +249,45 @@ impl RoutingHost {
                 request.context().id(),
             ));
         }
+        // Inherited, not restarted: this stage continues the route the preview
+        // opened.
+        self.admit_kv_route_with_budget(
+            request,
+            preview.phase,
+            Some(preview.signals.worker),
+            preview.budget,
+        )
+        .await
+    }
 
-        let phase = preview.phase;
+    /// Admit a KV route without a preview: select (or pin `planned_worker`) and
+    /// reserve, returning the plan a later dispatch consumes.
+    pub(crate) async fn admit_kv_route(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        planned_worker: Option<WorkerWithDpRank>,
+    ) -> Result<RoutePlan, Error> {
+        self.admit_kv_route_with_budget(request, phase, planned_worker, CleanupBudget::default())
+            .await
+    }
+
+    async fn admit_kv_route_with_budget(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        planned_worker: Option<WorkerWithDpRank>,
+        budget: CleanupBudget,
+    ) -> Result<RoutePlan, Error> {
+        if self.kv_router_if_enabled().is_none() {
+            return Err(anyhow::anyhow!("KV route plans require KV routing"));
+        }
+        if planned_worker.is_none() {
+            self.validate_explicit_worker(request.content(), phase)?;
+        }
+
         let phase_label = phase.to_string();
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
-        let planned_worker = preview.signals.worker;
         let select = || {
             self.select_with_session_affinity(request, phase, false, &budget, |target| {
                 let budget = &budget;
@@ -268,7 +297,7 @@ impl RoutingHost {
                         phase,
                         false,
                         target,
-                        Some(planned_worker),
+                        planned_worker,
                         FindBestMatchAdmission::WithAdmission,
                         budget,
                     )

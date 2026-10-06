@@ -4513,3 +4513,343 @@ async fn hard_parent_group_recovers_when_the_bound_worker_leaves() {
 
     runtime.shutdown();
 }
+
+/// The frontend adapter for the stage coordinator over real routing hosts.
+mod coordinated {
+    use std::collections::{HashMap, HashSet};
+
+    use dynamo_kv_router::WorkerType;
+    use dynamo_kv_router::conditional_disagg::IslBoundingPolicy;
+    use dynamo_kv_router::coordination::{
+        AdmissionTarget, AttemptId, ConditionalDisaggThresholds, ConditionalDisaggregationPolicy,
+        CoordinationPolicyFactory, HostAction, HostEvent, InvocationId,
+        LOCAL_PREFILL_DECODE_BRANCH, PlacementRule, PlanningMode, PoolRef, PrefillDecodePolicy,
+        ProfileName, ProgressivePrefillDecodePolicy, RequestSettings, RoutingCoordinator,
+        ScoringMode, SelectionInput, SelectionRestrictions, StageBinding, StageId, StageProfile,
+        StageProfiles, StageSelector, Topology, WorkAccounting,
+    };
+    use dynamo_kv_router::protocols::{
+        KvTransferEnforcement, RoutingConstraints, WorkerWithDpRank,
+    };
+    use dynamo_kv_router::scheduling::config::RouterConfigOverride;
+
+    use super::*;
+    use crate::kv_router::coordination::{
+        HostRoutePlan, HostStageSelector, SharedConditionalPolicy, routing_request_for,
+    };
+    use crate::local_model::runtime_config::ModelRuntimeConfig;
+
+    fn zoned_config(zone: &str) -> ModelRuntimeConfig {
+        let mut config = ModelRuntimeConfig {
+            topology_domains: HashMap::from([("zone".to_string(), zone.to_string())]),
+            ..ModelRuntimeConfig::default()
+        };
+        config.add_topology_taints();
+        config
+    }
+
+    fn transfer_config(zone: &str) -> ModelRuntimeConfig {
+        let mut config = zoned_config(zone);
+        config.kv_transfer_domain = Some("zone".to_string());
+        config.kv_transfer_enforcement = Some(KvTransferEnforcement::Required);
+        config
+    }
+
+    fn selector(
+        host: &Arc<RoutingHost>,
+        phase: RequestPhase,
+        pool: &str,
+        request: &Context<PreprocessedRequest>,
+    ) -> Arc<HostStageSelector> {
+        Arc::new(HostStageSelector::new(
+            Arc::clone(host),
+            phase,
+            PoolRef::new(pool.to_string(), 1),
+            request,
+        ))
+    }
+
+    fn bindings(
+        prefill: &Arc<RoutingHost>,
+        decode: &Arc<RoutingHost>,
+        request: &Context<PreprocessedRequest>,
+        conditional: bool,
+    ) -> Vec<StageBinding> {
+        let decode_scoring = if conditional {
+            ScoringMode::CacheAware
+        } else {
+            ScoringMode::LoadOnly
+        };
+        vec![
+            StageBinding::new(
+                StageId::PREFILL,
+                PoolRef::new("prefill", 1),
+                WorkerType::Prefill,
+                selector(prefill, RequestPhase::Prefill, "prefill", request),
+            ),
+            StageBinding::new(
+                StageId::DECODE,
+                PoolRef::new("decode", 1),
+                WorkerType::Decode,
+                selector(decode, RequestPhase::Decode, "decode", request),
+            )
+            .with_profiles(
+                StageProfiles::single(StageProfile::new(
+                    ProfileName::DECODE_ONLY,
+                    WorkAccounting::DecodeOnly,
+                    decode_scoring,
+                ))
+                .with_profile(StageProfile::new(
+                    ProfileName::LOCAL_PREFILL_DECODE,
+                    WorkAccounting::PrefillAndDecode,
+                    ScoringMode::CacheAware,
+                )),
+            ),
+        ]
+    }
+
+    fn always_bypass() -> CoordinationPolicyFactory {
+        Arc::new(|_| {
+            Box::new(ConditionalDisaggregationPolicy::new(
+                Box::new(SharedConditionalPolicy(Arc::new(IslBoundingPolicy::new(
+                    true,
+                    usize::MAX,
+                    2.0,
+                )))),
+                ConditionalDisaggThresholds::default(),
+                Box::new(ProgressivePrefillDecodePolicy::new()),
+            ))
+        })
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn conditional_bypass_admits_the_previewed_decode_worker_through_the_host() {
+        let (decode, decode_runtime) = router_with_workers(None, &[7, 8]).await;
+        let (prefill, prefill_runtime) = router_with_workers(None, &[11]).await;
+        let (decode, prefill) = (Arc::new(decode), Arc::new(prefill));
+        let request = Context::new(request());
+        let coordinator = RoutingCoordinator::new(
+            Topology::conditional_prefill_decode().with_rule(PlacementRule::TransferCompatible),
+            bindings(&prefill, &decode, &request, true),
+            always_bypass(),
+        )
+        .unwrap();
+        let routing_request = routing_request_for(request.content(), request.id(), None);
+        let mut session = coordinator
+            .start(routing_request, PlanningMode::Progressive)
+            .unwrap();
+
+        let HostAction::Execute(ready) = coordinator
+            .advance(&mut session, HostEvent::Continue)
+            .await
+            .unwrap()
+        else {
+            panic!("decode must be ready to execute");
+        };
+        assert_eq!(ready.stage, StageId::DECODE);
+        assert_eq!(ready.branch, LOCAL_PREFILL_DECODE_BRANCH);
+        // The host admitted exactly the previewed worker and nothing on prefill.
+        let decode_loads = potential_loads(&decode).await;
+        assert_eq!(
+            active_requests_for(&decode_loads, ready.target.worker.worker_id, 0),
+            1
+        );
+        assert_eq!(
+            decode_loads
+                .iter()
+                .filter(|load| load.active_requests > 0)
+                .count(),
+            1
+        );
+        assert!(
+            potential_loads(&prefill)
+                .await
+                .iter()
+                .all(|load| load.active_requests == 0)
+        );
+        assert_eq!(
+            decode.request_metrics.requests_started_total.get(),
+            0,
+            "admission is not a started request"
+        );
+
+        // The reservation is the host's route plan; releasing it frees the booking.
+        let plan = HostRoutePlan::take(ready.reservation).unwrap();
+        plan.abort().await;
+        assert!(
+            potential_loads(&decode)
+                .await
+                .iter()
+                .all(|load| load.active_requests == 0)
+        );
+
+        drop(session);
+        drop((decode, prefill));
+        decode_runtime.shutdown();
+        prefill_runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn remote_prefill_constrains_decode_to_the_prefill_transfer_domain() {
+        let (prefill, prefill_runtime) =
+            router_with_worker_configs(None, HashMap::from([(11, transfer_config("a"))])).await;
+        let (decode, decode_runtime) = router_with_worker_configs(
+            None,
+            HashMap::from([(7, zoned_config("b")), (8, zoned_config("a"))]),
+        )
+        .await;
+        let (decode, prefill) = (Arc::new(decode), Arc::new(prefill));
+        let request = Context::new(request());
+        let coordinator = RoutingCoordinator::new(
+            Topology::prefill_decode().with_rule(PlacementRule::TransferCompatible),
+            bindings(&prefill, &decode, &request, false),
+            Arc::new(|_| Box::new(PrefillDecodePolicy::prefill_first())),
+        )
+        .unwrap();
+        let plan = coordinator
+            .plan_all(routing_request_for(request.content(), request.id(), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.stage(&StageId::PREFILL)
+                .unwrap()
+                .target
+                .worker
+                .worker_id,
+            11
+        );
+        assert_eq!(
+            plan.stage(&StageId::DECODE)
+                .unwrap()
+                .target
+                .worker
+                .worker_id,
+            8,
+            "decode must land in the prefill worker's KV transfer zone"
+        );
+        assert_eq!(
+            active_requests_for(&potential_loads(&prefill).await, 11, 0),
+            1
+        );
+        assert_eq!(
+            active_requests_for(&potential_loads(&decode).await, 8, 0),
+            1
+        );
+
+        plan.release_all().await.unwrap();
+        assert!(
+            potential_loads(&decode)
+                .await
+                .iter()
+                .chain(potential_loads(&prefill).await.iter())
+                .all(|load| load.active_requests == 0)
+        );
+
+        drop((decode, prefill));
+        decode_runtime.shutdown();
+        prefill_runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn render_applies_the_stage_profile_and_coordinator_restrictions() {
+        let (decode, runtime) = router_with_workers(None, &[7, 8]).await;
+        let decode = Arc::new(decode);
+        let mut body = request();
+        body.routing_mut().expected_output_tokens = Some(64);
+        body.router_config_override = Some(RouterConfigOverride {
+            router_temperature: Some(0.3),
+            ..Default::default()
+        });
+        let request = Context::new(body);
+        request.controller().stop_generating();
+        let selector = selector(&decode, RequestPhase::Decode, "decode", &request);
+        let profiles = StageProfiles::for_worker_type(WorkerType::Decode);
+        let profile = profiles.default_profile();
+        let restrictions = SelectionRestrictions {
+            allowed_worker_ids: Some(HashSet::from([7, 8, 9])),
+            excluded_worker_ids: HashSet::from([8]),
+            pinned_worker: Some(WorkerWithDpRank::new(7, 0)),
+            routing_constraints: RoutingConstraints {
+                required_taints: HashSet::from(["zone=a".to_string()]),
+                preferred_taints: HashMap::from([("rack=1".to_string(), 0.5)]),
+            },
+            ..SelectionRestrictions::default()
+        };
+        let settings = RequestSettings::default();
+        let stage = StageId::DECODE;
+        let input = SelectionInput {
+            request_id: request.id(),
+            stage: &stage,
+            invocation: InvocationId::new(1),
+            attempt: AttemptId::FIRST,
+            prompt: dynamo_kv_router::coordination::PromptInputView {
+                token_ids: &request.content().token_ids,
+                block_mm_infos: None,
+                lora_name: None,
+                cache_namespace: None,
+            },
+            profile,
+            restrictions: &restrictions,
+            settings: &settings,
+        };
+        selector.set_staged_kv_cleanup(true);
+        let rendered = selector.render(&input);
+
+        // Shares the dispatch request's identity and cancellation.
+        assert_eq!(rendered.id(), request.id());
+        assert!(rendered.controller().is_stopped());
+        let body = rendered.content();
+        assert!(body.staged_kv_cleanup);
+        let config_override = body.router_config_override.as_ref().unwrap();
+        assert_eq!(config_override.router_temperature, Some(0.3));
+        assert_eq!(config_override.track_prefill_tokens, Some(false));
+        assert_eq!(config_override.assume_kv_reuse, Some(false));
+        assert_eq!(config_override.overlap_score_credit, Some(0.0));
+        let routing = body.routing.as_ref().unwrap();
+        assert_eq!(routing.expected_output_tokens, Some(64));
+        assert_eq!(routing.allowed_worker_ids, Some(HashSet::from([7, 9])));
+        assert_eq!(routing.decode_worker_id, Some(7));
+        assert_eq!(routing.dp_rank, Some(0));
+        let constraints = routing.routing_constraints.as_ref().unwrap();
+        assert!(constraints.required_taints.contains("zone=a"));
+        assert_eq!(constraints.preferred_taints["rack=1"], 0.5);
+        // The base request is untouched.
+        assert!(
+            request
+                .content()
+                .routing
+                .as_ref()
+                .unwrap()
+                .allowed_worker_ids
+                .is_none()
+        );
+
+        // An admission from a foreign preview is rejected before any selection.
+        let foreign = dynamo_kv_router::coordination::Preview {
+            target: dynamo_kv_router::coordination::SelectedTarget {
+                invocation: InvocationId::new(1),
+                attempt: AttemptId::FIRST,
+                stage: StageId::DECODE,
+                pool: PoolRef::new("decode", 2),
+                worker: WorkerWithDpRank::new(7, 0),
+                facts: Arc::default(),
+            },
+            signals: Default::default(),
+        };
+        let error = selector
+            .admit(input, AdmissionTarget::FromPreview(foreign))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            dynamo_kv_router::coordination::CoordinationError::StalePreview { .. }
+        ));
+
+        drop(selector);
+        drop(decode);
+        runtime.shutdown();
+    }
+}

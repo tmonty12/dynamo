@@ -40,10 +40,19 @@ use crate::{
 mod activation;
 mod admission;
 mod conditional_bypass;
+mod coordinated;
 mod handoff;
 mod query;
 use handoff::PrefillTask;
 pub use query::PrefillReservation;
+
+/// Distinguishes successive prefill bindings so a coordinator preview taken
+/// against one binding is never admitted against its replacement.
+static BINDING_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_binding_generation() -> u64 {
+    BINDING_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -228,7 +237,7 @@ pub struct PrefillRouter {
     decode_router_mode: RouterMode,
     session_affinity_ttl: Option<std::time::Duration>,
     session_affinity_mode: SessionAffinityMode,
-    conditional_disagg_policy: Box<dyn ConditionalDisaggPolicy>,
+    conditional_disagg_policy: Arc<dyn ConditionalDisaggPolicy>,
     /// Resolved once at construction: dedicated threshold if set, otherwise
     /// `router_queue_threshold`. `None` means the prefill-load condition is disabled.
     conditional_disagg_prefill_busy_threshold: Option<f64>,
@@ -254,6 +263,8 @@ struct PrefillBinding {
     /// `PrefillRouter` because it is unknowable until a target is discovered,
     /// and changes when the binding is rebuilt.
     prefill_router_mode: RouterMode,
+    /// Unique per binding; the coordinator's prefill pool generation.
+    generation: u64,
 }
 
 struct PrefillBuildContext {
@@ -326,6 +337,16 @@ impl
         // do not turn an advisory worker lookup into conditional local execution.
         if req.get_annotation_value("query_instance_id").is_some() {
             return next.generate(context.map(|_| req)).await;
+        }
+
+        // KV-routed prefill and decode: the coordinator decides branch, order,
+        // and profiles; this operator dispatches what it hands over.
+        if let Some(binding) = self.binding.load_full()
+            && let Some(decode_host) = self.coordinated_decode_host(&binding)
+        {
+            return self
+                .generate_coordinated(req, context, binding, decode_host)
+                .await;
         }
 
         let session_affinity = context
@@ -445,7 +466,7 @@ impl
         let prefill_result: Result<(PrefillOutcome, Option<RoutingConstraints>)> = async {
             let (prepared, prefill_stream) = router
                 .select_and_dispatch_prefill(prefill_context, |request, target| {
-                    self.prepare_prefill_dispatch(request, target, endpoint_id)
+                    self.prepare_prefill_dispatch(request, target, endpoint_id, true)
                 })
                 .await?;
             let topology_constraints = prepared.topology_constraints;
@@ -575,9 +596,9 @@ impl
 
 /// Prefill must survive client cancellation once decode needs its KV transfer.
 /// Copy request identity and metadata, but keep a separate cancellation controller.
-fn independent_prefill_context(
+fn independent_prefill_context<S: Send + Sync + 'static>(
     request: PreprocessedRequest,
-    source: &Context<()>,
+    source: &Context<S>,
 ) -> Result<Context<PreprocessedRequest>> {
     let mut prefill =
         Context::with_id_and_metadata(request, source.id().to_string(), source.metadata().clone());
@@ -586,6 +607,7 @@ fn independent_prefill_context(
 }
 
 impl PrefillRouter {
+    #[cfg(test)]
     pub(crate) fn conditional_disagg_enabled(&self) -> bool {
         self.conditional_disagg_policy.is_enabled()
     }
@@ -607,15 +629,23 @@ impl PrefillRouter {
         }
     }
 
+    /// Stamp the selected prefill worker and its bootstrap info onto the
+    /// prefill request. `derive_topology_constraints` computes the decode
+    /// constraints the legacy path merges itself; the coordinated path gets
+    /// them from its placement rules instead.
     fn prepare_prefill_dispatch(
         &self,
         request: &mut PreprocessedRequest,
         target: AffinityTarget,
         endpoint_id: &EndpointId,
+        derive_topology_constraints: bool,
     ) -> anyhow::Result<PreparedPrefill> {
         let AffinityTarget { worker_id, dp_rank } = target;
-        let topology_constraints =
-            self.preflight_kv_transfer_constraints(Some(endpoint_id), worker_id)?;
+        let topology_constraints = if derive_topology_constraints {
+            self.preflight_kv_transfer_constraints(Some(endpoint_id), worker_id)?
+        } else {
+            None
+        };
 
         let bootstrap_info = self
             .model_manager
