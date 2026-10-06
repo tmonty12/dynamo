@@ -117,6 +117,11 @@ impl SelectionCore {
         self.catalog.list(model_name, routing_group)
     }
 
+    /// The catalog record for one worker, if it is still a member.
+    pub fn worker_record(&self, worker_id: WorkerId) -> Option<WorkerCatalogRecord> {
+        self.catalog.get(worker_id)
+    }
+
     pub fn ready(&self) -> ReadyResponse {
         let schedulable_workers = self.catalog.schedulable_count();
         let workers = self.catalog.list(None, None);
